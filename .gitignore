@@ -1,0 +1,23 @@
+.DS_Store
+.idea/
+.vscode/
+*.iml
+.env
+.clickhouse-client.xml
+
+backend/.gradle/
+backend/build/
+backend/bin/
+
+frontend/node_modules/
+frontend/dist/
+
+python/.venv/
+python/__pycache__/
+python/*.csv
+
+# Local runtime state and derived data. Keep raw market-data inputs outside the repository.
+tmp/
+output/*.csv
+output/*.jsonl
+output/*.parquet

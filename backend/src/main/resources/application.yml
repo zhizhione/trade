@@ -1,0 +1,57 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: realtime-market-data
+  config:
+    import:
+      - optional:file:.env[.properties]
+      - optional:file:../.env[.properties]
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    admin:
+      fail-fast: false
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:market-data-service}
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        isolation.level: read_committed
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+    listener:
+      ack-mode: record
+      missing-topics-fatal: false
+
+app:
+  kafka:
+    enabled: ${KAFKA_ENABLED:true}
+  websocket:
+    allowed-origin-patterns: ${WS_ALLOWED_ORIGINS:http://localhost:*,http://127.0.0.1:*}
+  simulator:
+    enabled: ${MARKET_SIMULATOR_ENABLED:false}
+    interval-ms: ${MARKET_SIMULATOR_INTERVAL_MS:500}
+  atas:
+    event-time-zone: ${ATAS_EVENT_TIME_ZONE:America/Chicago}
+  storage:
+    clickhouse:
+      enabled: ${CLICKHOUSE_ENABLED:false}
+      url: jdbc:ch:http://${CLICKHOUSE_HOST:localhost}:${CLICKHOUSE_PORT:8123}/${CLICKHOUSE_DATABASE:market_data}
+      username: ${CLICKHOUSE_USERNAME:market}
+      password: ${CLICKHOUSE_PASSWORD:}
+    mysql:
+      enabled: ${MYSQL_ENABLED:false}
+      url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:market}
+      username: ${MYSQL_USERNAME:market}
+      password: ${MYSQL_PASSWORD:}
+
+logging:
+  level:
+    "[com.realtime.marketdata]": INFO
