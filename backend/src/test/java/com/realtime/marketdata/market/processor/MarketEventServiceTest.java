@@ -173,7 +173,7 @@ class MarketEventServiceTest {
     }
 
     @Test
-    void preservesEveryLevelFromANonMboDepthSnapshot() throws Exception {
+    void limitsNonMboDepthSnapshotsToFourHundredLevels() throws Exception {
         MarketStorageRepository storage = mock(MarketStorageRepository.class);
         MarketWebSocketHandler socket = mock(MarketWebSocketHandler.class);
         MarketEventService service = new MarketEventService(
@@ -183,7 +183,7 @@ class MarketEventServiceTest {
             new RealtimeMboBookService(),
             "America/Chicago"
         );
-        String levels = IntStream.range(0, 21)
+        String levels = IntStream.range(0, 450)
             .mapToObj(level -> "[%d,%d]".formatted(100 - level, level + 1))
             .collect(java.util.stream.Collectors.joining(","));
 
@@ -191,8 +191,8 @@ class MarketEventServiceTest {
 
         ArgumentCaptor<MarketSnapshot> snapshots = ArgumentCaptor.forClass(MarketSnapshot.class);
         verify(socket).broadcastSnapshot(snapshots.capture());
-        assertThat(snapshots.getValue().bids()).hasSize(21);
-        assertThat(snapshots.getValue().asks()).hasSize(21);
+        assertThat(snapshots.getValue().bids()).hasSize(400);
+        assertThat(snapshots.getValue().asks()).hasSize(400);
     }
 
     private String atasMbo(

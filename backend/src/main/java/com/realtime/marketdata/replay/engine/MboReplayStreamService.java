@@ -1,15 +1,14 @@
 package com.realtime.marketdata.replay.engine;
 
 import com.realtime.marketdata.mbo.model.MboEvent;
-import com.realtime.marketdata.orderbook.engine.MboBookEngine;
 import com.realtime.marketdata.orderbook.engine.MboBookEngineFactory;
 import com.realtime.marketdata.replay.model.ReplayBar;
 import com.realtime.marketdata.replay.model.ReplayFrame;
 import com.realtime.marketdata.replay.model.ReplayStreamRequest;
 import com.realtime.marketdata.replay.source.MboReplayEventSource;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
@@ -19,18 +18,22 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
  * 为每个 WebSocket 连接运行一条独立的历史原始事件回放流。
  *
- * <p>数据库读取器和历史 MBO 通路遵循与实时通路一致的事件顺序。任务不会预先构造巨大的
- * 响应，而是等待播放/暂停命令，逐条应用原始事件，并在每条 DBN 消息完整后推送到浏览器。</p>
+ * <p>数据库读取器和历史 MBO 通路遵循与实时通路一致的事件顺序。任务先在受限窗口内
+ * 按 {@code bucketMs} 重建回放帧并释放数据库游标，再等待播放/暂停命令按倍速推送，
+ * 避免交互等待占用 DBN 流。</p>
  */
 @Service
 public final class MboReplayStreamService {
     private static final int MAX_STREAM_FRAMES = 6_000;
     private static final MboBookEngineFactory ENGINE_FACTORY = new MboBookEngineFactory();
+    private static final Logger log = LoggerFactory.getLogger(MboReplayStreamService.class);
     /** 夜盘休市或周末的长时间空档不能阻塞交互式回放，因此会被压缩。 */
     private static final long MAX_INTERACTIVE_GAP_MS = 1_000L;
 
@@ -50,6 +53,11 @@ public final class MboReplayStreamService {
         BiConsumer<String, Object> sink
     ) {
         stop(connectionId);
+        log.info(
+            "Replay job started: connectionId={}, publisherId={}, instrumentId={}, startMs={}, endMs={}, bucketMs={}, barIntervalMs={}, speed={}, depth={}",
+            connectionId, request.publisherId(), request.instrumentId(), request.startMs(), request.endMs(),
+            request.bucketMs(), request.barIntervalMs(), request.speed(), request.depth()
+        );
         ReplayJob job = new ReplayJob(connectionId, request, sink);
         jobs.put(connectionId, job);
         sink.accept("replay_ready", Map.of(
@@ -58,6 +66,8 @@ public final class MboReplayStreamService {
             "symbol", source.symbol(request.publisherId(), request.instrumentId()),
             "bucketMs", request.bucketMs(),
             "barIntervalMs", request.barIntervalMs(),
+            "depth", request.depth(),
+            "diagnostic", request.diagnostic(),
             "startMs", request.startMs(),
             "endMs", request.endMs()
         ));
@@ -86,6 +96,7 @@ public final class MboReplayStreamService {
     public void stop(String connectionId) {
         ReplayJob job = jobs.remove(connectionId);
         if (job != null) {
+            log.info("Replay job stopping: connectionId={}", connectionId);
             job.stop();
         }
     }
@@ -130,6 +141,7 @@ public final class MboReplayStreamService {
                 stream();
             } catch (Exception exception) {
                 if (!stopped) {
+                    log.error("MBO replay stream failed for connection {}", connectionId, exception);
                     send("replay_error", Map.of("message", message(exception)));
                 }
             } finally {
@@ -138,11 +150,18 @@ public final class MboReplayStreamService {
         }
 
         private void stream() {
-            MboBookEngine engine = ENGINE_FACTORY.createHistorical();
-            Flow flow = new Flow();
+            long readStartedNanos = System.nanoTime();
+            log.info(
+                "Replay source read started: connectionId={}, publisherId={}, instrumentId={}, startMs={}, endMs={}",
+                connectionId, request.publisherId(), request.instrumentId(), request.startMs(), request.endMs()
+            );
+            MboReplaySampler sampler = new MboReplaySampler(
+                request.bucketMs(), ENGINE_FACTORY.create(false, request.depth()), request.startMs()
+            );
             MutableBar bar = new MutableBar(request.barIntervalMs());
             long[] previousFrameMs = {-1L};
-            boolean[] initialized = {false};
+            boolean[] truncated = {false};
+            List<BufferedMessage> buffered = new ArrayList<>();
 
             boolean completed = source.streamEvents(
                 request.publisherId(),
@@ -150,108 +169,141 @@ public final class MboReplayStreamService {
                 request.startMs(),
                 request.endMs(),
                 event -> accept(
-                    event, engine, flow, bar, previousFrameMs, initialized
+                    event, sampler, bar, previousFrameMs, truncated, buffered
                 )
             );
-            if (completed && !stopped) {
-                emitBar(bar.closeCompleted());
-                send("replay_complete", Map.of(
-                    "startMs", request.startMs(),
-                    "endMs", request.endMs()
-                ));
+            long readElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - readStartedNanos);
+            if (stopped) {
+                log.info(
+                    "Replay source read stopped: connectionId={}, frames={}, elapsedMs={}",
+                    connectionId, emittedFrames, readElapsedMs
+                );
+                return;
             }
+            if (!completed && !truncated[0]) {
+                log.warn(
+                    "Replay source ended before completion: connectionId={}, frames={}, elapsedMs={}",
+                    connectionId, emittedFrames, readElapsedMs
+                );
+                return;
+            }
+            if (completed && !truncated[0]) {
+                bufferFrames(sampler.finish(), bar, previousFrameMs, truncated, buffered);
+                if (!truncated[0]) {
+                    bufferBar(buffered, bar.closeCompleted());
+                }
+            }
+            buffered.add(new BufferedMessage("replay_complete", Map.of(
+                "startMs", request.startMs(),
+                "endMs", request.endMs(),
+                "truncated", truncated[0]
+            ), 0L));
+            log.info(
+                "Replay source read complete: connectionId={}, frames={}, messages={}, completed={}, truncated={}, elapsedMs={}",
+                connectionId, emittedFrames, buffered.size(), completed, truncated[0], readElapsedMs
+            );
+            playBuffered(buffered);
         }
 
         private boolean accept(
             MboEvent event,
-            MboBookEngine engine,
-            Flow flow,
+            MboReplaySampler sampler,
             MutableBar bar,
             long[] previousFrameMs,
-            boolean[] initialized
+            boolean[] truncated,
+            List<BufferedMessage> buffered
         ) {
-            if (!awaitPlaying()) {
+            if (stopped) {
                 return false;
             }
-            if (event.action() == 'R') {
-                initialized[0] = true;
-            }
-            Optional<MboBookEngine.BookSnapshot> result = engine.apply(event);
-            if (result.isEmpty()) {
-                return true;
-            }
-
             long timeMs = event.tsEventNs() / 1_000_000L;
-            if (timeMs < request.startMs()) {
-                return true;
-            }
-            if (timeMs > request.endMs()) {
+            boolean withinRequestedEnd = timeMs <= request.endMs();
+            if (!bufferFrames(
+                sampler.accept(event), bar, previousFrameMs, truncated, buffered
+            )) {
                 return false;
             }
-            // 起始时间之前的事件仅用于预热订单簿，不能增加首个可见帧的新增、撤单和成交统计。
-            flow.record(event);
-            ReplayFrame frame = frame(event, result.get(), flow, initialized[0], timeMs);
-            long previous = previousFrameMs[0];
-            if (previous >= 0) {
-                long eventDelta = Math.max(0L, timeMs - previous);
-                long interactiveDelta = Math.min(eventDelta, MAX_INTERACTIVE_GAP_MS);
-                if (!awaitDelay(interactiveDelta)) {
+            return withinRequestedEnd;
+        }
+
+        private boolean bufferFrames(
+            List<ReplayFrame> frames,
+            MutableBar bar,
+            long[] previousFrameMs,
+            boolean[] truncated,
+            List<BufferedMessage> buffered
+        ) {
+            long displayStartMs = Math.multiplyExact(
+                Math.floorDiv(request.startMs(), request.bucketMs()), request.bucketMs()
+            );
+            for (ReplayFrame frame : frames) {
+                if (frame.timeMs() < displayStartMs) {
+                    continue;
+                }
+                if (frame.timeMs() > request.endMs()) {
+                    return false;
+                }
+                long previous = previousFrameMs[0];
+                long delayMs = previous < 0
+                    ? 0L
+                    : Math.min(Math.max(0L, frame.timeMs() - previous), MAX_INTERACTIVE_GAP_MS);
+                buffered.add(new BufferedMessage("replay_frame", frame, delayMs));
+                emittedFrames += 1;
+                previousFrameMs[0] = frame.timeMs();
+                ReplayBar completedBar = bar.observe(frame);
+                bufferBar(buffered, completedBar);
+                bufferBar(buffered, bar.current());
+                if (emittedFrames >= MAX_STREAM_FRAMES) {
+                    // 限制浏览器端累积的帧数量，避免过大回放耗尽前端内存；用户可缩小时间窗口继续查询。
+                    truncated[0] = true;
                     return false;
                 }
             }
-            if (!awaitPlaying()) {
-                return false;
-            }
-            send("replay_frame", frame);
-            emittedFrames += 1;
-            previousFrameMs[0] = timeMs;
-            ReplayBar completedBar = bar.observe(timeMs, result.get());
-            emitBar(completedBar);
-            emitBar(bar.current());
-            flow.reset();
-            if (emittedFrames >= MAX_STREAM_FRAMES) {
-                // 限制浏览器端累积的帧数量，避免过大回放耗尽前端内存；用户可缩小时间窗口继续查询。
-                send("replay_complete", Map.of(
-                    "startMs", request.startMs(),
-                    "endMs", request.endMs(),
-                    "truncated", true
-                ));
-                return false;
-            }
-            return !stopped;
+            return true;
         }
 
-        private ReplayFrame frame(
-            MboEvent event,
-            MboBookEngine.BookSnapshot snapshot,
-            Flow flow,
-            boolean complete,
-            long timeMs
-        ) {
-            return new ReplayFrame(
-                timeMs,
-                event.sourceOrdinal(),
-                event.sequence(),
-                request.bucketMs(),
-                flow.addedSize,
-                flow.cancelledSize,
-                flow.tradedSize,
-                levels(snapshot.bids()),
-                levels(snapshot.asks()),
-                complete,
-                snapshot.crossed()
+        /**
+         * 先快速消费数据库结果，再按播放控制发送帧。若在数据库 ResultSet 上等待倍速，
+         * ClickHouse JDBC 的响应管道会在长回放中触发读超时并中断原始事件流。
+         */
+        private void playBuffered(List<BufferedMessage> buffered) {
+            long playbackStartedNanos = System.nanoTime();
+            int sentMessages = 0;
+            for (BufferedMessage message : buffered) {
+                if (!awaitPlaying()) {
+                    log.info(
+                        "Replay playback stopped before send: connectionId={}, messagesSent={}, frames={}",
+                        connectionId, sentMessages, emittedFrames
+                    );
+                    return;
+                }
+                if (message.delayMs() > 0 && !awaitDelay(message.delayMs())) {
+                    log.info(
+                        "Replay playback stopped during delay: connectionId={}, messagesSent={}, frames={}",
+                        connectionId, sentMessages, emittedFrames
+                    );
+                    return;
+                }
+                if (!awaitPlaying()) {
+                    log.info(
+                        "Replay playback stopped before message: connectionId={}, messagesSent={}, frames={}",
+                        connectionId, sentMessages, emittedFrames
+                    );
+                    return;
+                }
+                send(message.type(), message.payload());
+                sentMessages += 1;
+            }
+            log.info(
+                "Replay playback complete: connectionId={}, messagesSent={}, frames={}, elapsedMs={}",
+                connectionId, sentMessages, emittedFrames,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - playbackStartedNanos)
             );
         }
 
-        private List<ReplayFrame.DepthLevel> levels(List<MboBookEngine.Level> levels) {
-            return levels.stream()
-                .map(level -> new ReplayFrame.DepthLevel(level.priceNano(), level.size(), level.orderCount()))
-                .toList();
-        }
-
-        private void emitBar(ReplayBar value) {
+        private void bufferBar(List<BufferedMessage> buffered, ReplayBar value) {
             if (value != null) {
-                send("replay_bar", value);
+                buffered.add(new BufferedMessage("replay_bar", value, 0L));
             }
         }
 
@@ -355,26 +407,8 @@ public final class MboReplayStreamService {
             String message = exception.getMessage();
             return message == null || message.isBlank() ? exception.getClass().getSimpleName() : message;
         }
-    }
 
-    private static final class Flow {
-        private long addedSize;
-        private long cancelledSize;
-        private long tradedSize;
-
-        private void record(MboEvent event) {
-            switch (event.action()) {
-                case 'A' -> addedSize = Math.addExact(addedSize, event.size());
-                case 'C' -> cancelledSize = Math.addExact(cancelledSize, event.size());
-                case 'T' -> tradedSize = Math.addExact(tradedSize, event.size());
-                default -> { }
-            }
-        }
-
-        private void reset() {
-            addedSize = 0;
-            cancelledSize = 0;
-            tradedSize = 0;
+        private record BufferedMessage(String type, Object payload, long delayMs) {
         }
     }
 
@@ -386,13 +420,15 @@ public final class MboReplayStreamService {
             this.intervalMs = intervalMs;
         }
 
-        private ReplayBar observe(long timeMs, MboBookEngine.BookSnapshot snapshot) {
-            if (!snapshot.hasBbo() || snapshot.crossed()) return null;
+        private ReplayBar observe(ReplayFrame frame) {
+            if (!frame.complete() || frame.bids().isEmpty() || frame.asks().isEmpty() || frame.crossed()) {
+                return null;
+            }
             long midpoint = Math.floorDiv(
-                Math.addExact(snapshot.bids().getFirst().priceNano(), snapshot.asks().getFirst().priceNano()),
+                Math.addExact(frame.bids().getFirst().priceNano(), frame.asks().getFirst().priceNano()),
                 2
             );
-            long bucket = Math.multiplyExact(Math.floorDiv(timeMs, intervalMs), intervalMs);
+            long bucket = Math.multiplyExact(Math.floorDiv(frame.timeMs(), intervalMs), intervalMs);
             ReplayBar completed = null;
             if (current == null || current.timeMs() != bucket) {
                 completed = current;

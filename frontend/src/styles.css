@@ -509,22 +509,30 @@ h2 { margin: 3px 0 0; font-size: 16px; letter-spacing: -0.01em; }
 }
 .dom__header, .dom__row {
   display: grid;
-  grid-template-columns: minmax(90px, 1fr) 88px minmax(64px, .68fr);
+  grid-template-columns: minmax(90px, 1fr) 88px;
   align-items: center;
   font-variant-numeric: tabular-nums;
 }
 .dom__header {
   min-height: 28px;
   padding: 0 9px;
+  grid-template-columns: minmax(90px, 1fr) 88px auto;
   color: #667085;
   background: #f8fafc;
   font-size: 10px;
   text-align: right;
 }
 .dom__header span:nth-child(2) { text-align: center; }
-.dom__header span:not(:nth-child(2)) { text-align: center; }
 .dom__header span:first-child { text-align: right; }
-.dom__header small { display: block; margin-top: 2px; color: #98a2b3; font-size: 8px; font-weight: 500; }
+.dom__header button {
+  padding: 2px 0 2px 7px;
+  border: 0;
+  color: #667085;
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+}
+.dom__header button:hover { color: #155eef; }
 .dom__rows {
   flex: 1 1 auto;
   min-height: 0;
@@ -554,17 +562,6 @@ h2 { margin: 3px 0 0; font-size: 16px; letter-spacing: -0.01em; }
 .dom__quantity--ask { color: #b42318; text-align: left; }
 .dom__quantity--ask::before { left: 0; background: #fee4e2; }
 .dom__quantity small { margin-left: 4px; color: #98a2b3; font-size: 10px; }
-.dom__event-cell {
-  display: block;
-  min-height: 19px;
-  margin: 3px 4px;
-  padding: 3px 4px;
-  color: #98a2b3;
-  background: #f8fafc;
-  text-align: center;
-  font-size: 10px;
-}
-.dom__event-cell--cancel { color: #b54708; background: #fffaeb; }
 .dom__change {
   position: relative;
   z-index: 1;
@@ -647,7 +644,7 @@ h2 { margin: 3px 0 0; font-size: 16px; letter-spacing: -0.01em; }
   .terminal-toolbar button { padding-inline: 7px; }
   .terminal-summary { grid-template-columns: repeat(3, minmax(98px, 1fr)); }
   .terminal-summary__symbol { grid-column: span 3; }
-  .dom__header, .dom__row { grid-template-columns: minmax(76px, 1fr) 76px minmax(54px, .68fr); }
+  .dom__header, .dom__row { grid-template-columns: minmax(76px, 1fr) 76px; }
   .depth-controls { grid-template-columns: 1fr; }
   .depth-status { align-items: start; flex-wrap: wrap; padding-block: 5px; white-space: normal; }
   .feature-cell { padding: 7px 6px; }

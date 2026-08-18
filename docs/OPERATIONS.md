@@ -36,8 +36,10 @@ cd frontend && npm run build
 ## Schema 规则
 
 - `db/clickhouse_schema.sql` 是唯一的 ClickHouse 结构定义。
-- 新建 Docker 卷会自动执行该文件；已有数据卷缺表或缺文件目录时间边界列时，可在 DBeaver 中重复执行该文件。
-- `databento_mbo_file_catalog` 是唯一的 Databento 文件/身份目录，主键为
+- 新建 Docker 卷会自动执行该文件；已有数据卷必须先用 `SHOW CREATE TABLE` 确认目录排序键，
+  再按 README 中的迁移脚本补齐身份目录，不能依赖重复执行 `CREATE TABLE IF NOT EXISTS` 改变旧表排序键。
+- `databento_mbo_file_catalog` 是唯一的 Databento 文件/身份目录；稀疏主键为
+  `file_sha256`，ReplacingMergeTree 的排序/替换键为
   `(file_sha256, publisher_id, instrument_id)`，不能再新增平行目录表。
 - 该文件不删除或重建原始 MBO 表。现有 raw 表若与当前定义不兼容，应先备份，再从原始 DBN 重新导入。
 

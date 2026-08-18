@@ -8,6 +8,7 @@ public record ReplaySession(
     long instrumentId,
     String symbol,
     int bucketMs,
+    int depth,
     int barIntervalMs,
     List<ReplayBar> bars,
     List<ReplayFrame> frames,

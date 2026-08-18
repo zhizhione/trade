@@ -19,6 +19,11 @@ public record ReplayFrame(
     boolean complete,
     boolean crossed
 ) {
+    public ReplayFrame {
+        bids = List.copyOf(bids);
+        asks = List.copyOf(asks);
+    }
+
     public record DepthLevel(long priceNano, long size, int orderCount) {
     }
 }

@@ -20,7 +20,14 @@ import java.util.TreeMap;
  * 单个实时连接内有序时，调用方必须按来源流隔离引擎实例。</p>
  */
 public final class MboBookEngine {
-    /** 表示快照返回当前订单簿的全部价位。 */
+    /** 对外快照每侧最多返回的价位数。 */
+    public static final int MAX_DEPTH = 400;
+    /** 默认快照深度。 */
+    public static final int DEFAULT_DEPTH = MAX_DEPTH;
+    /**
+     * @deprecated 快照已统一限制为 {@link #MAX_DEPTH}，该常量仅为兼容旧调用方保留。
+     */
+    @Deprecated
     public static final int UNBOUNDED_DEPTH = Integer.MAX_VALUE;
     /** Databento 标志：该记录是当前消息的最后一条事件。 */
     public static final int F_LAST = 1 << 7;
@@ -37,7 +44,7 @@ public final class MboBookEngine {
 
     /** 创建严格模式引擎：发现交叉盘即失败，适用于生产校验和执行场景。 */
     public MboBookEngine() {
-        this(true, UNBOUNDED_DEPTH);
+        this(true, DEFAULT_DEPTH);
     }
 
     /**
@@ -45,7 +52,7 @@ public final class MboBookEngine {
      * 便于定位数据源或重建规则问题。
      */
     public MboBookEngine(boolean rejectCrossedBooks) {
-        this(rejectCrossedBooks, UNBOUNDED_DEPTH);
+        this(rejectCrossedBooks, DEFAULT_DEPTH);
     }
 
     public MboBookEngine(boolean rejectCrossedBooks, int snapshotDepth) {
@@ -390,14 +397,15 @@ public final class MboBookEngine {
         }
 
         private static List<Level> aggregate(NavigableMap<Long, PriceLevel> levels, int depth) {
-            List<Level> result = new ArrayList<>(Math.min(depth, levels.size()));
+            int effectiveDepth = Math.min(depth, MAX_DEPTH);
+            List<Level> result = new ArrayList<>(Math.min(effectiveDepth, levels.size()));
             for (Map.Entry<Long, PriceLevel> entry : levels.entrySet()) {
                 long size = 0;
                 for (RestingOrder order : entry.getValue().orders.values()) {
                     size = Math.addExact(size, order.size);
                 }
                 result.add(new Level(entry.getKey(), size, entry.getValue().orders.size()));
-                if (result.size() == depth) {
+                if (result.size() == effectiveDepth) {
                     break;
                 }
             }

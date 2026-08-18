@@ -7,13 +7,17 @@ import com.realtime.marketdata.replay.model.ReplayBar;
 import com.realtime.marketdata.replay.model.ReplayCatalogEntry;
 import com.realtime.marketdata.replay.model.ReplayFrame;
 import com.realtime.marketdata.replay.model.ReplaySession;
+import com.realtime.marketdata.replay.model.ReplayStreamRequest;
 import com.realtime.marketdata.replay.source.MboReplayEventSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 @Service
 public class MboReplayService {
     private static final long MAX_EPOCH_MILLIS = Long.MAX_VALUE / 1_000_000L;
     private static final MboBookEngineFactory ENGINE_FACTORY = new MboBookEngineFactory();
+    private static final Logger log = LoggerFactory.getLogger(MboReplayService.class);
 
     private final MboReplayEventSource source;
 
@@ -24,6 +28,7 @@ public class MboReplayService {
 
     /** 返回可选回放目录；目录由持久化适配器按文件与合约身份展开。 */
     public List<ReplayCatalogEntry> catalog() {
+        log.debug("Loading replay catalog");
         return source.catalog();
     }
 
@@ -40,6 +45,28 @@ public class MboReplayService {
         int limit,
         int barIntervalMs
     ) {
+        return session(publisherId, instrumentId, bucketMs, startMs, endMs, limit, barIntervalMs, false);
+    }
+
+    /**
+     * 重建历史窗口；诊断模式允许返回 400 档，否则默认限制为 100 档。
+     */
+    public ReplaySession session(
+        int publisherId,
+        long instrumentId,
+        int bucketMs,
+        long startMs,
+        long endMs,
+        int limit,
+        int barIntervalMs,
+        boolean diagnostic
+    ) {
+        long startedNanos = System.nanoTime();
+        log.info(
+            "Replay session started: publisherId={}, instrumentId={}, startMs={}, endMs={}, bucketMs={}, limit={}, barIntervalMs={}, depth={}",
+            publisherId, instrumentId, startMs, endMs, bucketMs, limit, barIntervalMs,
+            ReplayStreamRequest.depthFor(diagnostic)
+        );
         if (publisherId < 0 || publisherId > 0xffff) {
             throw new IllegalArgumentException("publisherId outside UInt16");
         }
@@ -58,7 +85,7 @@ public class MboReplayService {
         // 请求时间只是展示窗口，并非数据库可以直接定位的订单簿状态点。
         // 要得到 startMs 时刻正确的 L3 状态，必须按源顺序重放所选原始文件序列中此前的事件。
         MboReplaySampler sampler = new MboReplaySampler(
-            bucketMs, ENGINE_FACTORY.createHistorical(), startMs
+            bucketMs, ENGINE_FACTORY.create(false, ReplayStreamRequest.depthFor(diagnostic)), startMs
         );
         // 回放帧按时间桶采样。必须包含 startMs 所在桶，避免起始时刻之后的事件因桶起点
         // 早于请求时间而被错误丢弃。
@@ -83,17 +110,24 @@ public class MboReplayService {
                 nextStartMs = candidate;
             }
         }
-        return new ReplaySession(
+        ReplaySession session = new ReplaySession(
             "MULTI_FILE",
             publisherId,
             instrumentId,
             source.symbol(publisherId, instrumentId),
             bucketMs,
+            ReplayStreamRequest.depthFor(diagnostic),
             barIntervalMs,
             midpointBars(frames, barIntervalMs),
             frames,
             nextStartMs
         );
+        log.info(
+            "Replay session complete: publisherId={}, instrumentId={}, frames={}, bars={}, hasNextPage={}, elapsedMs={}",
+            publisherId, instrumentId, frames.size(), session.bars().size(), nextStartMs != null,
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
+        );
+        return session;
     }
 
     static List<ReplayBar> midpointBars(List<ReplayFrame> frames, int intervalMs) {

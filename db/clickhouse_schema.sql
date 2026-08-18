@@ -76,9 +76,10 @@ CREATE TABLE IF NOT EXISTS market_data.databento_mbo_file_catalog
     last_source_ordinal Nullable(UInt64) COMMENT '最后一条 MBO 在完整 DBN 解码流中的位置',
     status LowCardinality(String) DEFAULT 'completed' COMMENT '目录可用状态；事件提交成功后写 completed',
     updated_at DateTime64(3, 'UTC') DEFAULT now64(3) COMMENT '目录版本写入时间',
-    version UInt64 COMMENT 'ReplacingMergeTree 版本；同一文件保留最大版本'
+    version UInt64 COMMENT 'ReplacingMergeTree 版本；同一文件/身份保留最大版本'
 )
 ENGINE = ReplacingMergeTree(version)
+PRIMARY KEY file_sha256
 ORDER BY (file_sha256, publisher_id, instrument_id)
 SETTINGS index_granularity = 8192;
 
@@ -209,22 +210,3 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(ts_snapshot)
 ORDER BY (canonical_id, ts_snapshot, source)
 SETTINGS index_granularity = 8192;
-
--- 兼容在文件目录首次引入前创建的数据卷。新版目录在 CREATE TABLE 中已含这两列，
--- 因此重复执行时为无操作。
-ALTER TABLE market_data.databento_mbo_file_catalog
-    ADD COLUMN IF NOT EXISTS min_ts_event Nullable(UInt64)
-    AFTER last_ts_event;
-ALTER TABLE market_data.databento_mbo_file_catalog
-    ADD COLUMN IF NOT EXISTS max_ts_event Nullable(UInt64)
-    AFTER min_ts_event;
-ALTER TABLE market_data.databento_mbo_file_catalog
-    ADD COLUMN IF NOT EXISTS publisher_id UInt16
-    AFTER file_sha256;
-ALTER TABLE market_data.databento_mbo_file_catalog
-    ADD COLUMN IF NOT EXISTS instrument_id UInt32
-    AFTER publisher_id;
-ALTER TABLE market_data.databento_mbo_file_catalog
-    DROP COLUMN IF EXISTS identity_counts;
--- 已存在的旧表若仍按 file_sha256 排序，不能在不重建数据部件的情况下扩展排序键；
--- 需要在确认目录为空或完成单独数据迁移后，将表重建为上面的复合 ORDER BY。

@@ -29,4 +29,18 @@ class ReplayWebSocketHandlerTest {
 
         verify(replay).stop("connection-1");
     }
+
+    @Test
+    void ignoresPauseWhenTheReplayJobHasAlreadyStopped() {
+        MboReplayStreamService replay = mock(MboReplayStreamService.class);
+        ReplayWebSocketHandler handler = new ReplayWebSocketHandler(JsonMapper.builder().build(), replay);
+        WebSocketSession session = mock(WebSocketSession.class);
+        when(session.getId()).thenReturn("connection-1");
+
+        assertThatCode(() -> handler.handleTextMessage(
+            session, new TextMessage("{\"type\":\"replay_pause\",\"payload\":{}}")
+        )).doesNotThrowAnyException();
+
+        verify(replay).pause("connection-1");
+    }
 }

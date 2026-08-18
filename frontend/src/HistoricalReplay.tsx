@@ -76,6 +76,7 @@ export function HistoricalReplay() {
         instrumentId: ready.instrumentId,
         symbol: ready.symbol,
         bucketMs: ready.bucketMs,
+        depth: ready.depth,
         barIntervalMs: ready.barIntervalMs,
         bars: [],
         frames: [],
@@ -333,7 +334,7 @@ export function HistoricalReplay() {
   const pricePadding = priceRange
     ? Math.max((priceRange.max - priceRange.min) * 0.06, 0.25)
     : 0;
-  const viewDepthLabel = '当前快照全部深度';
+  const viewDepthLabel = `当前快照最多${session?.depth ?? 100}档`;
 
   return (
     <main className="replay-terminal">
@@ -460,7 +461,7 @@ export function HistoricalReplay() {
           </div>
           <div className="depth-status">
             <span>当前视图 <strong>{viewDepthLabel}</strong></span>
-            <span title="当前回放帧的实际价位数；服务端未设置档位上限">
+            <span title="当前回放帧的实际价位数；服务端每侧最多返回400档">
               买 <strong>{bidLevelCount}</strong> 档 · 卖 <strong>{askLevelCount}</strong> 档
             </span>
           </div>
@@ -477,12 +478,12 @@ export function HistoricalReplay() {
           <section className="feature-grid" aria-label="当前实时特征">
             <div className="feature-cell"><span>Spread</span><strong>{formatDecimal(spread)}</strong><small>ask − bid</small></div>
             <div className="feature-cell"><span>Microprice</span><strong>{formatDecimal(microPrice)}</strong><small>按 BBO 数量加权</small></div>
-          <div className="feature-cell"><span>Imbalance</span><strong>{imbalance === undefined ? '—' : imbalance.toFixed(3)}</strong><small>全深度买卖比</small></div>
+            <div className="feature-cell"><span>Imbalance</span><strong>{imbalance === undefined ? '—' : imbalance.toFixed(3)}</strong><small>400档买卖比</small></div>
             <div className="feature-cell"><span>净挂单量</span><strong className={netAdded !== undefined && netAdded < 0 ? 'feature-negative' : 'feature-positive'}>{formatSignedQuantity(netAdded)}</strong><small>A − C</small></div>
             <div className="feature-cell"><span>撤单率</span><strong>{formatRate(cancelRate)}</strong><small>C / (A + C)</small></div>
             <div className="feature-cell"><span>OFI</span><strong className="feature-pending">—</strong><small>待逐价位事件数据</small></div>
           </section>
-          <p className="feature-caption">盘口价格范围与 K 线价格轴同步；挂单柱为当前档位数量。逐价位撤单数据待后端事件字段补全。</p>
+          <p className="feature-caption">盘口价格范围与 K 线价格轴同步。</p>
         </aside>
       </section>
 

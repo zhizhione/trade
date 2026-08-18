@@ -43,7 +43,7 @@ app:
   storage:
     clickhouse:
       enabled: ${CLICKHOUSE_ENABLED:false}
-      url: jdbc:ch:http://${CLICKHOUSE_HOST:localhost}:${CLICKHOUSE_PORT:8123}/${CLICKHOUSE_DATABASE:market_data}
+      url: jdbc:ch:http://${CLICKHOUSE_HOST:localhost}:${CLICKHOUSE_PORT:8123}/${CLICKHOUSE_DATABASE:market_data}?socket_timeout=${CLICKHOUSE_SOCKET_TIMEOUT_MS:600000}
       username: ${CLICKHOUSE_USERNAME:market}
       password: ${CLICKHOUSE_PASSWORD:}
     mysql:

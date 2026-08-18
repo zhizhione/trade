@@ -27,7 +27,7 @@ class MboReplayStreamServiceTest {
     }
 
     @Test
-    void streamsFLastSnapshotsOnlyAfterPlayAndBuildsBarsAtTheRequestedInterval() throws Exception {
+    void streamsBucketedSnapshotsOnlyAfterPlayAndBuildsBarsAtTheRequestedInterval() throws Exception {
         InMemorySource source = new InMemorySource(List.of(
             event(0, 0, 0, 'R', 'N', 0, 0),
             event(1, 10_000_000, 101, 'A', 'B', 100, 10),
@@ -53,8 +53,8 @@ class MboReplayStreamServiceTest {
         assertThat(service.play("socket-1")).isTrue();
         assertThat(complete.await(2, TimeUnit.SECONDS)).isTrue();
 
-        assertThat(frames).extracting(ReplayFrame::timeMs).containsExactly(0L, 10L, 20L, 120L);
-        assertThat(frames.get(2)).satisfies(frame -> {
+        assertThat(frames).extracting(ReplayFrame::timeMs).containsExactly(0L, 100L);
+        assertThat(frames.getFirst()).satisfies(frame -> {
             assertThat(frame.complete()).isTrue();
             assertThat(frame.bids()).containsExactly(new ReplayFrame.DepthLevel(100, 10, 1));
             assertThat(frame.asks()).containsExactly(new ReplayFrame.DepthLevel(102, 7, 1));
@@ -65,6 +65,34 @@ class MboReplayStreamServiceTest {
             new ReplayBar(100, 101, 101, 101, 101),
             new ReplayBar(100, 101, 101, 101, 101)
         );
+    }
+
+    @Test
+    void readsTheSourceBeforeWaitingForPlayback() throws Exception {
+        CountDownLatch sourceFinished = new CountDownLatch(1);
+        InMemorySource source = new InMemorySource(List.of(
+            event(0, 0, 0, 'R', 'N', 0, 0),
+            event(1, 10_000_000, 101, 'A', 'B', 100, 10),
+            event(2, 20_000_000, 201, 'A', 'A', 102, 7)
+        ), sourceFinished);
+        service = new MboReplayStreamService(source);
+        List<ReplayFrame> frames = new ArrayList<>();
+
+        service.start("socket-buffered", new ReplayStreamRequest(1, 750, 100, 0, 20, 100, 1_000),
+            (type, payload) -> {
+                if ("replay_frame".equals(type)) frames.add((ReplayFrame) payload);
+            }
+        );
+
+        assertThat(sourceFinished.await(1, TimeUnit.SECONDS)).isTrue();
+        assertThat(frames).isEmpty();
+        assertThat(service.play("socket-buffered")).isTrue();
+        // The source has already been fully consumed, so playback only waits on the local buffer.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+        while (frames.isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        assertThat(frames).hasSize(1);
     }
 
     @Test
@@ -87,7 +115,7 @@ class MboReplayStreamServiceTest {
 
         assertThat(service.play("socket-gap")).isTrue();
         assertThat(complete.await(3, TimeUnit.SECONDS)).isTrue();
-        assertThat(frames).extracting(ReplayFrame::timeMs).containsExactly(0L, 10L, 10_000L);
+        assertThat(frames).extracting(ReplayFrame::timeMs).containsExactly(0L, 10_000L);
     }
 
     @Test
@@ -111,8 +139,8 @@ class MboReplayStreamServiceTest {
 
         assertThat(service.play("socket-crossed")).isTrue();
         assertThat(complete.await(2, TimeUnit.SECONDS)).isTrue();
-        assertThat(frames).extracting(ReplayFrame::timeMs).containsExactly(0L, 10L, 20L, 120L);
-        assertThat(frames.get(2).crossed()).isTrue();
+        assertThat(frames).extracting(ReplayFrame::timeMs).containsExactly(0L, 100L);
+        assertThat(frames.getFirst().crossed()).isTrue();
     }
 
     @Test
@@ -136,7 +164,7 @@ class MboReplayStreamServiceTest {
 
         assertThat(service.play("socket-window")).isTrue();
         assertThat(complete.await(2, TimeUnit.SECONDS)).isTrue();
-        assertThat(frames).extracting(ReplayFrame::timeMs).containsExactly(60L, 120L);
+        assertThat(frames).extracting(ReplayFrame::timeMs).containsExactly(0L, 100L);
         assertThat(frames.getFirst()).satisfies(frame -> {
             assertThat(frame.addedSize()).isZero();
             assertThat(frame.cancelledSize()).isEqualTo(3);
@@ -160,9 +188,15 @@ class MboReplayStreamServiceTest {
 
     private static final class InMemorySource implements MboReplayEventSource {
         private final List<MboEvent> events;
+        private final CountDownLatch finished;
 
         private InMemorySource(List<MboEvent> events) {
+            this(events, new CountDownLatch(0));
+        }
+
+        private InMemorySource(List<MboEvent> events, CountDownLatch finished) {
             this.events = List.copyOf(events);
+            this.finished = finished;
         }
 
         @Override
@@ -178,10 +212,14 @@ class MboReplayStreamServiceTest {
             long endMs,
             MboEventConsumer consumer
         ) {
-            for (MboEvent event : events) {
-                if (!consumer.accept(event)) return false;
+            try {
+                for (MboEvent event : events) {
+                    if (!consumer.accept(event)) return false;
+                }
+                return true;
+            } finally {
+                finished.countDown();
             }
-            return true;
         }
 
         @Override

@@ -1,6 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import type { CSSProperties } from 'react';
 import { nanoPrice, type ReplayFrame } from '../domain/replay';
+
+const DOM_CENTERING_EASE = 0.035;
 
 interface DomLadderProps {
   frame?: ReplayFrame;
@@ -9,9 +11,15 @@ interface DomLadderProps {
   priceRange?: { min: number; max: number };
 }
 
-export function DomLadder({ frame, previousFrame, searchPrice = '', priceRange }: DomLadderProps) {
+export function DomLadder({
+  frame,
+  previousFrame,
+  searchPrice = '',
+  priceRange,
+}: DomLadderProps) {
   const rowsRef = useRef<HTMLDivElement>(null);
   const centeringAnimationRef = useRef<number | undefined>(undefined);
+  const manualScrollRef = useRef(false);
   const bids = frame?.bids ?? [];
   const asks = frame?.asks ?? [];
   const normalizedSearch = searchPrice.trim().replaceAll(',', '');
@@ -30,10 +38,15 @@ export function DomLadder({ frame, previousFrame, searchPrice = '', priceRange }
   const maxSize = Math.max(1, ...levels.map((level) => level.size));
   const bestBid = bids[0]?.priceNano;
   const bestAsk = asks[0]?.priceNano;
-  // 每个回放帧都把买三/卖三之间的位置保持在可视区域中央，
-  // 让盘口围绕更稳定的近端深度展示；不足三档时退回到最深可用档位。
-  useEffect(() => {
-    if (!frame) return;
+  const cancelCentering = useCallback(() => {
+    if (centeringAnimationRef.current !== undefined) {
+      window.cancelAnimationFrame(centeringAnimationRef.current);
+      centeringAnimationRef.current = undefined;
+    }
+  }, []);
+
+  const centerRows = useCallback((force = false) => {
+    if (!force && manualScrollRef.current) return;
     const element = rowsRef.current;
     if (!element) return;
     const rowHeight = 27;
@@ -50,9 +63,7 @@ export function DomLadder({ frame, previousFrame, searchPrice = '', priceRange }
       ? visibleIndices.reduce((sum, index) => sum + index, 0) / visibleIndices.length
       : levels.length / 2;
     const target = Math.max(0, (anchorRow + 0.5) * rowHeight - element.clientHeight / 2);
-    if (centeringAnimationRef.current !== undefined) {
-      window.cancelAnimationFrame(centeringAnimationRef.current);
-    }
+    cancelCentering();
     const animateCentering = () => {
       const distance = target - element.scrollTop;
       if (Math.abs(distance) <= 0.5) {
@@ -60,33 +71,59 @@ export function DomLadder({ frame, previousFrame, searchPrice = '', priceRange }
         centeringAnimationRef.current = undefined;
         return;
       }
-      element.scrollTop += distance * 0.08;
+      element.scrollTop += distance * DOM_CENTERING_EASE;
       centeringAnimationRef.current = window.requestAnimationFrame(animateCentering);
     };
     centeringAnimationRef.current = window.requestAnimationFrame(animateCentering);
-    return () => {
-      if (centeringAnimationRef.current !== undefined) {
-        window.cancelAnimationFrame(centeringAnimationRef.current);
-        centeringAnimationRef.current = undefined;
-      }
-    };
-  }, [frame, levels.length, searchPrice]);
+  }, [asks, bids, cancelCentering, levels]);
+
+  // 用户开始浏览上下档位后，暂停逐帧自动居中，避免滚动位置被回放抢回。
+  const suspendAutoCentering = useCallback(() => {
+    manualScrollRef.current = true;
+    cancelCentering();
+  }, [cancelCentering]);
+
+  useEffect(() => {
+    if (!frame) {
+      manualScrollRef.current = false;
+    }
+  }, [frame]);
+
+  useEffect(() => {
+    if (!frame || manualScrollRef.current) return;
+    centerRows();
+    return cancelCentering;
+  }, [cancelCentering, centerRows, frame, levels.length, searchPrice]);
+
+  const recenter = () => {
+    manualScrollRef.current = false;
+    centerRows(true);
+  };
 
   return (
     <div
       className="dom"
-      aria-label="当前全深度订单簿"
+      aria-label="当前订单簿"
       data-price-min={priceRange?.min}
       data-price-max={priceRange?.max}
     >
       <div className="dom__header">
         <span>挂单</span>
         <span>价格</span>
-        <span>撤单 <small>Σ {frame?.cancelledSize?.toLocaleString() ?? '—'}</small></span>
+        <button type="button" title="回到买三和卖三附近" onClick={recenter}>居中</button>
       </div>
       <div
         className="dom__rows"
         ref={rowsRef}
+        tabIndex={0}
+        onPointerDown={suspendAutoCentering}
+        onTouchStart={suspendAutoCentering}
+        onWheel={suspendAutoCentering}
+        onKeyDown={(event) => {
+          if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
+            suspendAutoCentering();
+          }
+        }}
       >
         {levels.length === 0 && (
           <p className="empty-state">
@@ -108,7 +145,6 @@ export function DomLadder({ frame, previousFrame, searchPrice = '', priceRange }
                 {changeKind && <em className="dom__change" title="相对上一回放帧的档位数量变化">{changeLabel}</em>}
               </span>
               <strong>{nanoPrice(level.priceNano).toFixed(2)}</strong>
-              <span className="dom__event-cell dom__event-cell--cancel" title="逐价位撤单数据待后端补充">—</span>
             </div>
           );
         })}

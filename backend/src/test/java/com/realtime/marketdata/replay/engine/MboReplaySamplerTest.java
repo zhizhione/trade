@@ -60,13 +60,14 @@ class MboReplaySamplerTest {
         sampler.accept(event(0, 0, 1, 'R', 'N', 0, 0, MboBookEngine.F_LAST));
         sampler.accept(event(1, 10_000_000, 2, 'A', 'B', 100, 8, MboBookEngine.F_LAST));
         sampler.accept(event(2, 20_000_000, 2, 'C', 'B', 100, 3, MboBookEngine.F_LAST));
+        sampler.accept(event(3, 30_000_000, 2, 'C', 'B', 100, 2, MboBookEngine.F_LAST));
         List<ReplayFrame> emitted = sampler.accept(
-            event(3, 120_000_000, 3, 'T', 'N', 100, 5, MboBookEngine.F_LAST)
+            event(4, 120_000_000, 3, 'T', 'N', 100, 5, MboBookEngine.F_LAST)
         );
 
         assertThat(emitted).singleElement().satisfies(row -> {
             assertThat(row.addedSize()).isEqualTo(8);
-            assertThat(row.cancelledSize()).isEqualTo(3);
+            assertThat(row.cancelledSize()).isEqualTo(5);
             assertThat(row.tradedSize()).isZero();
         });
         assertThat(sampler.finish()).singleElement().satisfies(row -> {

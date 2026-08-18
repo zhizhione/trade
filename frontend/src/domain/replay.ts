@@ -53,6 +53,7 @@ export interface ReplaySession {
   instrumentId: number;
   symbol: string;
   bucketMs: number;
+  depth: number;
   barIntervalMs: number;
   bars: ReplayBar[];
   frames: ReplayFrame[];
@@ -65,6 +66,8 @@ export interface ReplayStreamReady {
   symbol: string;
   bucketMs: number;
   barIntervalMs: number;
+  depth: number;
+  diagnostic: boolean;
   startMs: number;
   endMs: number;
 }

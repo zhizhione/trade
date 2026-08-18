@@ -3,7 +3,7 @@
 面向实时行情和 Databento 历史 MBO 研究的数据平台。项目目前覆盖两条链路：
 
 - 实时链路：Kafka 事件经 Spring Boot 标准化、持久化，并通过 WebSocket 推送到 React 看板。
-- 历史链路：Python 无损导入 DBN，Java 回放服务按请求从 raw MBO 流式读取并逐事件重建 L3 订单簿，React 使用 Lightweight Charts 展示 K 线、DOM 二十档和特征。
+- 历史链路：Python 无损导入 DBN，Java 回放服务按请求从 raw MBO 流式读取并逐事件重建 L3 订单簿，React 使用 Lightweight Charts 展示 K 线、DOM 最多 400 档和特征。
 
 当前已经完成历史 MBO 的有序唯一存储、单文件订单簿重建和可视化回放。`feature_extractor.py`
 仍是 CSV 滚动特征原型；包含排队成交、手续费、滑点和资金曲线的完整策略回测引擎尚未实现。
@@ -173,14 +173,14 @@ ORDER BY completed_at;
 用户提交 `startMs`、`endMs` 和 K 线周期后，
 前端向 `/ws/replay` 发送 `replay_start`；收到任务就绪消息后自动发送一次 `replay_play`，后端会按
 时间范围选择原始文件，从 `databento_mbo_raw FINAL` 按每个文件的 `source_ordinal` 顺序读取 raw MBO，并在
-Java 状态机中逐条处理。每个带 `F_LAST` 的完整 DBN 消息都会作为一帧实时盘口推送给浏览器，回放时钟根据
-相邻 `ts_event` 的真实时间差和当前倍速推进。
+Java 状态机中逐条处理。`F_LAST` 仅用于确认一条 DBN 消息完成；服务端在每个 `bucketMs` 时间桶结束时推送该桶的
+最终盘口帧，普通模式每侧最多 100 档，`diagnostic=true` 才允许每侧最多 400 档。回放时钟根据相邻帧的事件时间差和当前倍速推进。
 
-为保证窗口起点的队列状态正确，后端会处理起始文件在请求时间之前的事件，但不会把这些预热事件推送给
-浏览器；若时间范围从一个分片中间开始，还会带上目录顺序中的前一个文件作为预热。服务端按前端选定的秒数在线聚合中间价 OHLC；无需再预先返回固定数量的快照或由前端本地计时播放。
+为保证窗口起点的队列状态正确，后端会从首个相交文件向前查找最近的 `R` reset，并从该文件开始处理预热事件；
+预热事件不会推送给浏览器。找不到 reset 时会拒绝回放，避免输出不完整订单簿。服务端按前端选定的秒数在线聚合中间价 OHLC；无需再预先返回固定数量的快照或由前端本地计时播放。
 
 在线回放会保留交叉盘并标记 `crossed=true`，便于诊断源数据；前端不把它当作有效当前价，策略和回测必须显式过滤
-`!complete` 或 `crossed` 帧。单个 WebSocket 请求最多推送 6,000 个可见帧，超过后页面会提示缩小时间范围。
+`!complete` 或 `crossed` 帧。单个 WebSocket 请求最多推送 6,000 个可见时间桶帧，超过后页面会提示缩小时间范围。
 
 ### 6. 启动后端
 
@@ -326,7 +326,7 @@ raw 提交、目录写入和 job 完成不是一个 ClickHouse 跨表事务。�
 ```text
 GET /api/replay/catalog
 GET /api/replay/session?publisherId=...&instrumentId=...&bucketMs=100
-                        &startMs=...&endMs=...&limit=6000&barIntervalMs=1000
+                        &startMs=...&endMs=...&limit=6000&barIntervalMs=1000&diagnostic=false
 WS  /ws/replay
 ```
 
@@ -337,9 +337,9 @@ WS  /ws/replay
 回放页面展示：
 
 - 用户选择 1、5、15、30 或 60 秒周期后，由服务端基于完整、非交叉快照中间价在线生成 K 线。
-- DOM 当前完整买卖盘口，包含每档数量和订单数。
-- 右侧当前快照的完整价格深度，以及当前采样桶的挂单、撤单两列。
-- BBO、价差、全深度不平衡、完整性和交叉盘状态。
+- DOM 当前买卖盘口（普通模式每侧最多 100 档，诊断模式最多 400 档），包含每档数量和订单数。
+- 右侧当前快照的最多 400 档价格深度，以及回放至当前帧的挂单变化提示。
+- BBO、400 档深度不平衡、完整性和交叉盘状态。
 - 播放、暂停、单步、倍速和已接收帧的时间轴跳转。单次请求超过 6,000 帧时需要拆分时间范围。
 
 ## 文件目录回填
@@ -360,15 +360,53 @@ python/.venv/bin/python python/backfill_mbo_file_catalog.py /data/2024-mbo
 
 同日分片可逐文件配合 `--file-order N` 回填。
 
-已有旧文件级目录的数据卷，先执行当前 schema，再执行以下回填脚本，从 raw 表按身份展开写入主目录表：
+已有旧文件级目录的数据卷，确认目录表已使用
+`ORDER BY (file_sha256, publisher_id, instrument_id)` 后，先执行以下身份迁移语句：
 
 ```bash
 docker compose exec -T clickhouse sh -lc \
   'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --database market_data' \
-  < db/backfill_replay_identity_catalog.sql
+  < db/migrate_mbo_file_catalog_identity.sql
 ```
 
-脚本会扫描 raw 表；完成后确认 `/api/replay/catalog` 和主目录的身份列正常。脚本不会删除旧的兼容行。
+脚本会从 raw 表重新统计每个文件/身份的行数和时间边界。完成校验后，再单独执行：
+
+```bash
+docker compose exec -T clickhouse sh -lc \
+  'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --database market_data' \
+  < db/delete_replay_identity_zero_rows.sql
+```
+
+删除语句会清理旧的 `(publisher_id, instrument_id) = (0, 0)` 兼容行。
+
+迁移后、删除前先确认每个 raw 身份都有等行数的目录记录：
+
+```sql
+SELECT raw.file_sha256, raw.publisher_id, raw.instrument_id,
+       raw.mbo_rows AS raw_mbo_rows, catalog.mbo_rows AS catalog_mbo_rows
+FROM
+(
+    SELECT file_sha256, publisher_id, instrument_id, count() AS mbo_rows
+    FROM market_data.databento_mbo_raw FINAL
+    WHERE publisher_id > 0 AND instrument_id > 0
+    GROUP BY file_sha256, publisher_id, instrument_id
+) AS raw
+LEFT JOIN
+(
+    SELECT file_sha256, publisher_id, instrument_id, mbo_rows
+    FROM market_data.databento_mbo_file_catalog FINAL
+    WHERE status = 'completed' AND publisher_id > 0 AND instrument_id > 0
+) AS catalog USING (file_sha256, publisher_id, instrument_id)
+WHERE catalog.mbo_rows IS NULL OR raw.mbo_rows != catalog.mbo_rows;
+```
+
+该查询必须返回零行。执行清理脚本后，以下查询必须返回 `0`：
+
+```sql
+SELECT count()
+FROM market_data.databento_mbo_file_catalog FINAL
+WHERE publisher_id = 0 AND instrument_id = 0;
+```
 
 ## 常用验证 SQL
 
@@ -384,8 +422,8 @@ ORDER BY updated_at DESC;
 查看文件目录：
 
 ```sql
-SELECT trading_date, file_order, display_name, file_sha256, mbo_rows,
-       first_ts_event, last_ts_event
+SELECT trading_date, file_order, display_name, file_sha256, publisher_id, instrument_id,
+       mbo_rows, min_ts_event, max_ts_event
 FROM market_data.databento_mbo_file_catalog FINAL
 WHERE status = 'completed'
 ORDER BY trading_date NULLS LAST, file_order, display_name;
@@ -421,9 +459,10 @@ LEFT JOIN
 ) AS raw USING (file_sha256)
 LEFT JOIN
 (
-    SELECT file_sha256, mbo_rows
+    SELECT file_sha256, sum(mbo_rows) AS mbo_rows
     FROM market_data.databento_mbo_file_catalog FINAL
-    WHERE status = 'completed'
+    WHERE status = 'completed' AND publisher_id > 0 AND instrument_id > 0
+    GROUP BY file_sha256
 ) AS catalog USING (file_sha256)
 ORDER BY jobs.display_name;
 ```
@@ -440,7 +479,9 @@ ORDER BY source_ordinal;
 ## 数据库 schema
 
 `db/clickhouse_schema.sql` 是 ClickHouse 的唯一结构定义。新数据卷会由 Compose 自动初始化；
-已有数据卷可在 DBeaver 中直接执行该文件，以创建缺失表并补齐目录时间边界列。
+已有数据卷执行前必须先用 `SHOW CREATE TABLE market_data.databento_mbo_file_catalog` 确认
+`PRIMARY KEY file_sha256` 和 `ORDER BY (file_sha256, publisher_id, instrument_id)` 已存在。
+`CREATE TABLE IF NOT EXISTS` 不会修改旧表的排序键；旧文件级目录应按上面的迁移、校验、清理步骤处理。
 
 如果现有 `databento_mbo_raw` 的列或排序键不符合该文件定义，不能用 DDL 就地猜测或转换原始
 MBO 记录。请先备份现有表，再从原始 DBN 使用 `python/import_dbn.py` 导入到符合当前 schema 的库。

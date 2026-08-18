@@ -190,6 +190,7 @@ public class MarketEventService {
 
     private List<DepthLevel> depthLevels(List<MboBookEngine.Level> levels) {
         return levels.stream()
+            .limit(MboBookEngine.MAX_DEPTH)
             .map(level -> new DepthLevel(
                 BigDecimal.valueOf(level.priceNano(), 9),
                 BigDecimal.valueOf(level.size())
@@ -235,6 +236,9 @@ public class MarketEventService {
             }
             if (price != null && quantity != null) {
                 result.add(new DepthLevel(price, quantity));
+                if (result.size() == MboBookEngine.MAX_DEPTH) {
+                    break;
+                }
             }
         }
         return result;

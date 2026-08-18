@@ -18,6 +18,7 @@ export function loadReplaySession(
   endMs: number,
   limit = 6000,
   barIntervalMs = 1000,
+  diagnostic = false,
 ): Promise<ReplaySession> {
   const params = new URLSearchParams({
     publisherId: String(entry.publisherId),
@@ -27,6 +28,7 @@ export function loadReplaySession(
     endMs: String(endMs),
     limit: String(limit),
     barIntervalMs: String(barIntervalMs),
+    diagnostic: String(diagnostic),
   });
   return getJson(`/api/replay/session?${params}`);
 }

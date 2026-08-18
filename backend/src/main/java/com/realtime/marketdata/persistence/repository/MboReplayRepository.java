@@ -44,39 +44,45 @@ public class MboReplayRepository implements MboReplayEventSource {
           AND catalog.mbo_rows > 0
           AND catalog.publisher_id > 0
           AND catalog.instrument_id > 0
-          AND catalog.first_ts_event IS NOT NULL
-          AND catalog.last_ts_event IS NOT NULL
-        ORDER BY catalog.trading_date, catalog.file_order, catalog.display_name,
+          AND coalesce(catalog.min_ts_event, catalog.first_ts_event) IS NOT NULL
+          AND coalesce(catalog.max_ts_event, catalog.last_ts_event) IS NOT NULL
+        ORDER BY catalog.trading_date NULLS LAST, catalog.file_order, catalog.display_name,
                  catalog.publisher_id, catalog.instrument_id
         """;
     private static final String RAW_EVENTS_SQL = """
         SELECT source_ordinal, ts_recv, ts_event, rtype, publisher_id, instrument_id,
                action, side, price, size, channel_id, order_id, flags, ts_in_delta, sequence
         FROM market_data.databento_mbo_raw FINAL
-        WHERE file_sha256 = toFixedString(?, 64)
-          AND publisher_id = ?
+        PREWHERE file_sha256 = toFixedString(?, 64)
+        WHERE publisher_id = ?
           AND instrument_id = ?
           AND ts_event <= ?
         ORDER BY source_ordinal
         """;
+    private static final String RESET_ORDINAL_SQL = """
+        SELECT minOrNull(source_ordinal)
+        FROM market_data.databento_mbo_raw FINAL
+        PREWHERE file_sha256 = toFixedString(?, 64)
+        WHERE publisher_id = ?
+          AND instrument_id = ?
+          AND action = 'R'
+        """;
     // min/max 在导入时按事件时间计算；first/last 则保留源顺序首尾值，供审计原始文件顺序。
     private static final String FILE_RANGES_SQL = """
-        SELECT toString(file_sha256),
-               any(coalesce(min_ts_event, first_ts_event)) AS min_ts_event,
-               any(coalesce(max_ts_event, last_ts_event)) AS max_ts_event
-        FROM market_data.databento_mbo_file_catalog FINAL
-        WHERE status = 'completed' AND mbo_rows > 0
-          AND publisher_id > 0 AND instrument_id > 0
-        GROUP BY file_sha256
-        ORDER BY any(trading_date), any(file_order), any(display_name), file_sha256
-        """;
-    private static final String FILE_STREAM_RANGE_SQL = """
-        SELECT count(), max(source_ordinal)
-        FROM market_data.databento_mbo_raw FINAL
-        WHERE file_sha256 = toFixedString(?, 64)
-          AND publisher_id = ?
-          AND instrument_id = ?
-          AND ts_event <= ?
+        SELECT toString(catalog.file_sha256),
+               min(coalesce(catalog.min_ts_event, catalog.first_ts_event)) AS min_ts_event,
+               max(coalesce(catalog.max_ts_event, catalog.last_ts_event)) AS max_ts_event,
+               max(catalog.last_source_ordinal) AS last_source_ordinal
+        FROM market_data.databento_mbo_file_catalog AS catalog FINAL
+        WHERE catalog.status = 'completed'
+          AND catalog.mbo_rows > 0
+          AND catalog.publisher_id = ?
+          AND catalog.instrument_id = ?
+          AND coalesce(catalog.min_ts_event, catalog.first_ts_event) IS NOT NULL
+          AND coalesce(catalog.max_ts_event, catalog.last_ts_event) IS NOT NULL
+        GROUP BY catalog.file_sha256
+        ORDER BY min(catalog.trading_date) NULLS LAST, min(catalog.file_order),
+                 min(catalog.display_name), catalog.file_sha256
         """;
     private final boolean enabled;
     private final String url;
@@ -100,6 +106,7 @@ public class MboReplayRepository implements MboReplayEventSource {
     @SuppressWarnings("unused")
     void initialize() {
         if (!enabled) {
+            log.info("ClickHouse replay storage is disabled");
             return;
         }
         HikariConfig config = new HikariConfig();
@@ -113,6 +120,7 @@ public class MboReplayRepository implements MboReplayEventSource {
         config.setConnectionTimeout(3_000);
         config.setInitializationFailTimeout(-1);
         dataSource = new HikariDataSource(config);
+        log.info("ClickHouse replay storage initialized: poolSize={}", config.getMaximumPoolSize());
     }
 
     @Override
@@ -134,6 +142,7 @@ public class MboReplayRepository implements MboReplayEventSource {
     }
 
     private List<ReplayCatalogEntry> catalogOnce() throws SQLException {
+        long startedNanos = System.nanoTime();
         try (Connection connection = dataSource.getConnection();
              PreparedStatement statement = connection.prepareStatement(FILE_CATALOG_SQL);
              ResultSet rows = statement.executeQuery()) {
@@ -148,7 +157,12 @@ public class MboReplayRepository implements MboReplayEventSource {
                     rows.getLong(5)
                 ));
             }
-            return List.copyOf(result);
+            List<ReplayCatalogEntry> catalog = List.copyOf(result);
+            log.info(
+                "Loaded replay catalog: entries={}, elapsedMs={}",
+                catalog.size(), elapsedMs(startedNanos)
+            );
+            return catalog;
         }
     }
 
@@ -184,18 +198,30 @@ public class MboReplayRepository implements MboReplayEventSource {
         requireEnabled();
         long startNs = Math.multiplyExact(startMs, 1_000_000L);
         long endNs = Math.multiplyExact(endMs, 1_000_000L);
+        long startedNanos = System.nanoTime();
+        log.info(
+            "Replay event stream started: publisherId={}, instrumentId={}, startMs={}, endMs={}",
+            publisherId, instrumentId, startMs, endMs
+        );
         try (Connection connection = dataSource.getConnection();
-             PreparedStatement rangesStatement = connection.prepareStatement(FILE_RANGES_SQL);
-             PreparedStatement streamRangeStatement = connection.prepareStatement(FILE_STREAM_RANGE_SQL)) {
+             PreparedStatement rangesStatement = connection.prepareStatement(FILE_RANGES_SQL)) {
+            rangesStatement.setInt(1, publisherId);
+            rangesStatement.setLong(2, instrumentId);
             List<CatalogRange> catalogRanges = new ArrayList<>();
             try (ResultSet rows = rangesStatement.executeQuery()) {
                 while (rows.next()) {
                     long minTsEvent = rows.getLong(2);
                     boolean minWasNull = rows.wasNull();
                     long maxTsEvent = rows.getLong(3);
-                    if (!minWasNull && !rows.wasNull()) {
+                    boolean maxWasNull = rows.wasNull();
+                    long lastSourceOrdinal = rows.getLong(4);
+                    Long lastSourceOrdinalValue = rows.wasNull() ? null : lastSourceOrdinal;
+                    if (!minWasNull && !maxWasNull) {
                         catalogRanges.add(new CatalogRange(
-                            rows.getString(1).replace("\0", ""), minTsEvent, maxTsEvent
+                            rows.getString(1).replace("\0", ""),
+                            minTsEvent,
+                            maxTsEvent,
+                            lastSourceOrdinalValue
                         ));
                     }
                 }
@@ -211,24 +237,26 @@ public class MboReplayRepository implements MboReplayEventSource {
                 }
             }
             if (firstOverlap < 0) {
+                log.info(
+                    "Replay event stream has no overlapping files: publisherId={}, instrumentId={}, elapsedMs={}",
+                    publisherId, instrumentId, elapsedMs(startedNanos)
+                );
                 return true;
             }
-            // 将紧邻的前一文件纳入预热段，覆盖从同日拆分文件中间开始的查询；当前文件自身的
-            // reset 记录随后会建立完整状态。
-            int warmupStart = Math.max(0, firstOverlap - 1);
+            int warmupStart = findWarmupStart(
+                connection, catalogRanges, firstOverlap, publisherId, instrumentId
+            );
             List<FileRange> ranges = new ArrayList<>();
             for (int index = warmupStart; index <= lastOverlap; index++) {
                 CatalogRange catalogRange = catalogRanges.get(index);
-                FileRange range = streamRange(
-                    streamRangeStatement, catalogRange.fileSha256(), publisherId, instrumentId, endNs
-                );
-                if (range != null) {
-                    ranges.add(range);
-                }
+                ranges.add(new FileRange(
+                    catalogRange.fileSha256(), catalogRange.lastSourceOrdinal()
+                ));
             }
 
             long ordinalBase = 0;
             long previousEventNs = Long.MIN_VALUE;
+            long streamedEvents = 0L;
             for (FileRange range : ranges) {
                 FileStreamResult result = streamFile(
                     connection,
@@ -240,43 +268,69 @@ public class MboReplayRepository implements MboReplayEventSource {
                     previousEventNs,
                     consumer
                 );
+                streamedEvents += result.streamedEvents();
                 if (!result.exhausted()) {
+                    log.info(
+                        "Replay event stream stopped by consumer: publisherId={}, instrumentId={}, files={}, events={}, elapsedMs={}",
+                        publisherId, instrumentId, ranges.size(), streamedEvents, elapsedMs(startedNanos)
+                    );
                     return false;
                 }
                 previousEventNs = Math.max(previousEventNs, result.lastEventNs());
                 // 磁盘上的 source_ordinal 是 UInt64。Java 以 long 保存其位模式，递增时必须
                 // 使用无符号语义；Math.addExact 会错误拒绝最高位为 1 的合法顺序号。
-                long fileEnd = range.lastSourceOrdinal() >= 0
-                    ? range.lastSourceOrdinal()
-                    : result.maxSourceOrdinal();
-                ordinalBase += fileEnd + 1;
+                if (range.lastSourceOrdinal() != null) {
+                    ordinalBase += range.lastSourceOrdinal() + 1;
+                } else if (result.hasSourceOrdinal()) {
+                    ordinalBase += result.maxSourceOrdinal() + 1;
+                }
             }
+            log.info(
+                "Replay event stream complete: publisherId={}, instrumentId={}, files={}, events={}, elapsedMs={}",
+                publisherId, instrumentId, ranges.size(), streamedEvents, elapsedMs(startedNanos)
+            );
             return true;
         } catch (SQLException exception) {
+            log.error(
+                "Replay event stream failed: publisherId={}, instrumentId={}, startMs={}, endMs={}, elapsedMs={}",
+                publisherId, instrumentId, startMs, endMs, elapsedMs(startedNanos), exception
+            );
             throw replayQueryFailure("stream raw MBO replay events", exception);
         }
     }
 
-    private FileRange streamRange(
-        PreparedStatement statement,
-        String fileSha256,
+    private int findWarmupStart(
+        Connection connection,
+        List<CatalogRange> catalogRanges,
+        int firstOverlap,
         int publisherId,
-        long instrumentId,
-        long endNs
+        long instrumentId
     ) throws SQLException {
-        statement.setString(1, fileSha256);
-        statement.setInt(2, publisherId);
-        statement.setLong(3, instrumentId);
-        statement.setLong(4, endNs);
-        try (ResultSet rows = statement.executeQuery()) {
-            if (!rows.next() || rows.getLong(1) == 0) {
-                return null;
+        try (PreparedStatement resetStatement = connection.prepareStatement(RESET_ORDINAL_SQL)) {
+            for (int index = firstOverlap; index >= 0; index--) {
+                CatalogRange range = catalogRanges.get(index);
+                resetStatement.setString(1, range.fileSha256());
+                resetStatement.setInt(2, publisherId);
+                resetStatement.setLong(3, instrumentId);
+                try (ResultSet rows = resetStatement.executeQuery()) {
+                    if (rows.next()) {
+                        long resetOrdinal = rows.getLong(1);
+                        if (!rows.wasNull()) {
+                            log.debug(
+                                "Replay warmup reset found: file={}, publisherId={}, instrumentId={}, resetOrdinal={}",
+                                shortSha(range.fileSha256()), publisherId, instrumentId,
+                                Long.toUnsignedString(resetOrdinal)
+                            );
+                            return index;
+                        }
+                    }
+                }
             }
-            return new FileRange(
-                fileSha256,
-                rows.getLong(2)
-            );
         }
+        throw new ReplayDataAccessException(
+            "Unable to rebuild replay order book: no reset event found for publisherId="
+                + publisherId + ", instrumentId=" + instrumentId
+        );
     }
 
     private FileStreamResult streamFile(
@@ -292,6 +346,11 @@ public class MboReplayRepository implements MboReplayEventSource {
         long maxSourceOrdinal = 0L;
         boolean hasSourceOrdinal = false;
         long lastEventNs = previousEventNs;
+        long streamedEvents = 0L;
+        log.debug(
+            "Replay file read started: file={}, publisherId={}, instrumentId={}, ordinalBase={}",
+            shortSha(range.fileSha256()), publisherId, instrumentId, ordinalBase
+        );
         try (PreparedStatement statement = connection.prepareStatement(RAW_EVENTS_SQL)) {
             statement.setString(1, range.fileSha256());
             statement.setInt(2, publisherId);
@@ -307,19 +366,27 @@ public class MboReplayRepository implements MboReplayEventSource {
                         hasSourceOrdinal = true;
                     }
                     MboEvent next = event(rows, ordinalBase);
-                    // 每个日度 DBN 文件会重复更早时间戳的初始订单簿记录。首文件已建立状态后，
-                    // 应忽略这些重复记录，才能让跨文件回放保持时间顺序。
+                    // 日度 DBN 文件可能重复更早时间戳的初始订单簿记录。首文件已建立状态后，
+                    // 忽略这些重复记录，保持采样器的时间桶单调递增。
                     if (next.tsEventNs() <= previousEventNs) {
                         continue;
                     }
                     lastEventNs = next.tsEventNs();
+                    streamedEvents += 1;
                     if (!consumer.accept(next)) {
-                        return new FileStreamResult(false, maxSourceOrdinal, lastEventNs);
+                        return new FileStreamResult(
+                            false, maxSourceOrdinal, hasSourceOrdinal, lastEventNs, streamedEvents
+                        );
                     }
                 }
             }
         }
-        return new FileStreamResult(true, maxSourceOrdinal, lastEventNs);
+        log.debug(
+            "Replay file read complete: file={}, publisherId={}, instrumentId={}, events={}, lastSourceOrdinal={}",
+            shortSha(range.fileSha256()), publisherId, instrumentId, streamedEvents,
+            hasSourceOrdinal ? Long.toUnsignedString(maxSourceOrdinal) : "none"
+        );
+        return new FileStreamResult(true, maxSourceOrdinal, hasSourceOrdinal, lastEventNs, streamedEvents);
     }
 
     @Override
@@ -384,26 +451,42 @@ public class MboReplayRepository implements MboReplayEventSource {
         return new ReplayDataAccessException("Unable to " + operation, exception);
     }
 
+    private long elapsedMs(long startedNanos) {
+        return java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
+    }
+
+    private String shortSha(String fileSha256) {
+        return fileSha256.length() <= 12 ? fileSha256 : fileSha256.substring(0, 12);
+    }
+
     private record FileRange(
         String fileSha256,
-        long lastSourceOrdinal
+        Long lastSourceOrdinal
     ) {
     }
 
     private record CatalogRange(
         String fileSha256,
         long minTsEvent,
-        long maxTsEvent
+        long maxTsEvent,
+        Long lastSourceOrdinal
     ) {
     }
 
-    private record FileStreamResult(boolean exhausted, long maxSourceOrdinal, long lastEventNs) {
+    private record FileStreamResult(
+        boolean exhausted,
+        long maxSourceOrdinal,
+        boolean hasSourceOrdinal,
+        long lastEventNs,
+        long streamedEvents
+    ) {
     }
 
     @PreDestroy
     @SuppressWarnings("unused")
     void close() {
         if (dataSource != null) {
+            log.info("Closing ClickHouse replay storage");
             dataSource.close();
         }
     }

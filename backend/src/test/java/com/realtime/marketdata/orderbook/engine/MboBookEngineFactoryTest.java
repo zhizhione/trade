@@ -9,22 +9,22 @@ import org.junit.jupiter.api.Test;
 class MboBookEngineFactoryTest {
 
     @Test
-    void historicalAndLiveEnginesReturnEveryAvailablePriceLevel() {
+    void historicalAndLiveEnginesLimitSnapshotsToFourHundredPriceLevels() {
         MboBookEngineFactory factory = new MboBookEngineFactory();
 
-        assertThat(snapshotBidCount(factory::createHistorical)).isEqualTo(51);
-        assertThat(snapshotBidCount(factory::createLive)).isEqualTo(51);
+        assertThat(snapshotBidCount(factory::createHistorical)).isEqualTo(MboBookEngine.MAX_DEPTH);
+        assertThat(snapshotBidCount(factory::createLive)).isEqualTo(MboBookEngine.MAX_DEPTH);
     }
 
     @Test
-    void directEngineDefaultsAlsoReturnEveryAvailablePriceLevel() {
-        assertThat(snapshotBidCount(MboBookEngine::new)).isEqualTo(51);
+    void directEngineDefaultsAlsoLimitSnapshotsToFourHundredPriceLevels() {
+        assertThat(snapshotBidCount(MboBookEngine::new)).isEqualTo(MboBookEngine.MAX_DEPTH);
     }
 
     private int snapshotBidCount(Supplier<MboBookEngine> engineSupplier) {
         MboBookEngine engine = engineSupplier.get();
-        for (int level = 0; level < 51; level++) {
-            if (level == 50) {
+        for (int level = 0; level < MboBookEngine.MAX_DEPTH + 50; level++) {
+            if (level == MboBookEngine.MAX_DEPTH + 49) {
                 return engine.apply(event(level, MboBookEngine.F_LAST)).orElseThrow().bids().size();
             }
             engine.apply(event(level, 0));
