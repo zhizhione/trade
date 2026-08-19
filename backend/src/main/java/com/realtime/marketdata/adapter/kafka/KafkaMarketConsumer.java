@@ -2,6 +2,7 @@ package com.realtime.marketdata.adapter.kafka;
 
 import com.realtime.marketdata.config.KafkaConfig;
 import com.realtime.marketdata.market.processor.MarketEventService;
+import com.realtime.marketdata.orderbook.engine.MboBookInvariantException;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,6 +40,14 @@ public class KafkaMarketConsumer {
     public void consume(ConsumerRecord<String, String> record) {
         try {
             marketEventService.process(record.topic(), record.value());
+        } catch (MboBookInvariantException exception) {
+            // Defensive boundary: the realtime adapter normally converts this into a
+            // desynchronized result, but it must never poison a Kafka partition if a future
+            // adapter path lets the invariant escape.
+            log.warn(
+                "Skipping invalid MBO event from topic {} partition {} offset {}: {}",
+                record.topic(), record.partition(), record.offset(), exception.getMessage()
+            );
         } catch (JacksonException | IllegalArgumentException exception) {
             log.warn(
                 "Skipping malformed market event from topic {} partition {} offset {}: {}",

@@ -19,10 +19,32 @@ public record LiveMboEvent(
     long priceNano,
     long size,
     long orderId,
-    long sequence
+    long sequence,
+    Long priority
 ) {
     /** Sentinel used by delete updates when the provider omits side or price. */
     public static final long MISSING_PRICE_NANO = Long.MIN_VALUE;
+
+    /** Provider queue priority when supplied by the live feed; null means derive it from source order. */
+    public static final Long MISSING_PRIORITY = null;
+
+    /** Backwards-compatible constructor for feeds without an explicit priority field. */
+    public LiveMboEvent(
+        long sourceOrdinal,
+        long tsRecvNs,
+        long tsEventNs,
+        int publisherId,
+        long instrumentId,
+        Action action,
+        char side,
+        long priceNano,
+        long size,
+        long orderId,
+        long sequence
+    ) {
+        this(sourceOrdinal, tsRecvNs, tsEventNs, publisherId, instrumentId, action, side,
+            priceNano, size, orderId, sequence, MISSING_PRIORITY);
+    }
     /**
      * {@code DELETE} 与 {@code CANCEL} 被有意区分：ATAS 等供应商可以发送“删除订单”而
      * 不给出本次撤销量。对于 DELETE，引擎会直接移除该活跃订单的全部剩余数量。

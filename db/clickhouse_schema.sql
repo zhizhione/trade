@@ -126,9 +126,9 @@ CREATE TABLE IF NOT EXISTS market_data.atas_mbo_raw
     side LowCardinality(String) COMMENT '挂单方向：Bid=买方订单、Ask=卖方订单',
     priority UInt64 COMMENT '交易所订单优先级或队列排序值；Change 即使价格数量不变但 priority 变化也必须更新',
     exchange_order_id UInt64 COMMENT '交易所订单 ID；New 插入、Change 更新、Delete 删除均以此字段定位订单',
-    price Decimal64(9) COMMENT 'ATAS 提供的十进制委托价格，统一保留 9 位小数精度',
-    price_nano Int64 COMMENT '委托价格乘以 10^9 后的整数；供精确比较、聚合及与 Databento price_nano 对齐',
-    volume UInt64 COMMENT '当前 MBO 事件携带的订单数量；具体为新状态还是变化量按 ATAS New/Change/Delete 规则解释',
+    price Nullable(Decimal64(9)) COMMENT 'ATAS 提供的十进制委托价格；仅带 order_id 的 Delete 可为空',
+    price_nano Nullable(Int64) COMMENT '委托价格乘以 10^9 后的整数；仅带 order_id 的 Delete 可为空',
+    volume Nullable(UInt64) COMMENT '当前 MBO 事件携带的订单数量；仅带 order_id 的 Delete 可为空',
     ingested_at DateTime64(3, 'UTC') DEFAULT now64(3) COMMENT '该消息写入 ClickHouse 的 UTC 时间，用于监控采集延迟和入库进度',
     INDEX idx_atas_mbo_event_time event_time_utc TYPE minmax GRANULARITY 1
 )

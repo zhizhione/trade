@@ -46,6 +46,16 @@ class MboReplaySamplerTest {
     }
 
     @Test
+    void marksTheBookCompleteWhenItObservesClearBeforeTheMessageBoundary() {
+        MboReplaySampler sampler = new MboReplaySampler(100, 10, false);
+        assertThat(sampler.accept(event(0, 0, 1, 'R', 'N', 0, 0, 0))).isEmpty();
+
+        sampler.accept(event(1, 1, 2, 'A', 'B', 100, 1, MboBookEngine.F_LAST));
+
+        assertThat(sampler.finish()).singleElement().extracting(ReplayFrame::complete).isEqualTo(true);
+    }
+
+    @Test
     void foldsEventTimeRegressionIntoTheLatestSourceOrderedBucket() {
         MboReplaySampler sampler = new MboReplaySampler(100, 10, false);
         sampler.accept(event(0, 200_000_000, 1, 'R', 'N', 0, 0, MboBookEngine.F_LAST));

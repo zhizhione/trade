@@ -6,14 +6,19 @@ import com.realtime.marketdata.mbo.processor.MboStreamKey;
 import com.realtime.marketdata.mbo.processor.MboStreamProcessor;
 import com.realtime.marketdata.orderbook.engine.MboBookEngine;
 import com.realtime.marketdata.orderbook.engine.MboBookEngineFactory;
+import com.realtime.marketdata.orderbook.engine.MboBookInvariantException;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.JsonNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 将有序 ATAS MBO 消息转换为与传输方式无关的 Java L3 状态机输入。
@@ -25,13 +30,23 @@ import tools.jackson.databind.JsonNode;
 @Service
 public final class RealtimeMboBookService {
     private static final int ATAS_PUBLISHER_ID = 0;
+    private static final Logger log = LoggerFactory.getLogger(RealtimeMboBookService.class);
     private final MboStreamProcessor streams = new MboStreamProcessor(new MboBookEngineFactory());
+    private final Set<MboStreamKey> desynchronizedStreams = ConcurrentHashMap.newKeySet();
 
     /** Explicitly drops a source stream after disconnect or provider session rollover. */
     public void closeStream(String streamId) {
         if (streamId != null && !streamId.isBlank()) {
-            streams.close(new MboStreamKey("atas", streamId));
+            MboStreamKey key = new MboStreamKey("atas", streamId);
+            desynchronizedStreams.remove(key);
+            streams.close(key);
         }
+    }
+
+    /** Returns whether incremental updates for a stream are quarantined after an invariant error. */
+    public boolean isDesynchronized(String streamId) {
+        return streamId != null && !streamId.isBlank()
+            && desynchronizedStreams.contains(new MboStreamKey("atas", streamId));
     }
 
     @Scheduled(fixedDelayString = "${app.atas.mbo-stream-eviction-ms:300000}")
@@ -43,13 +58,64 @@ public final class RealtimeMboBookService {
      * 应用一条完整 ATAS MBO 消息并返回重建后的盘口深度。非 MBO 消息、不支持的来源或字段
      * 不完整的消息不会触碰状态机，避免错误输入破坏已有订单簿。
      */
+    /** Backwards-compatible snapshot-only API; desynchronized and ignored inputs return empty. */
     public Optional<MboBookEngine.BookSnapshot> apply(MarketEvent event) {
+        return applyDetailed(event).optionalSnapshot();
+    }
+
+    /** Applies an event while preserving whether an empty result means ignored or desynchronized. */
+    public ApplyResult applyDetailed(MarketEvent event) {
         Optional<NormalizedLiveUpdate> update = normalize(event);
         if (update.isEmpty()) {
-            return Optional.empty();
+            return ApplyResult.ignored();
         }
         NormalizedLiveUpdate normalized = update.get();
-        return streams.accept(normalized.stream(), normalized.event());
+        if (desynchronizedStreams.contains(normalized.stream())) {
+            return ApplyResult.desynchronized(
+                normalized.stream().streamId(), "stream is quarantined; await explicit close/reset"
+            );
+        }
+        try {
+            return ApplyResult.applied(
+                streams.accept(normalized.stream(), normalized.event()).orElseThrow(),
+                normalized.stream().streamId()
+            );
+        } catch (MboBookInvariantException exception) {
+            // A bad update makes the incremental book untrustworthy.  Drop only this source
+            // stream so a later provider snapshot/reconnect can rebuild it from a clean state;
+            // the raw event is still persisted by the caller.
+            streams.close(normalized.stream());
+            desynchronizedStreams.add(normalized.stream());
+            log.warn(
+                "ATAS MBO stream desynchronized; waiting for a fresh stream: streamId={}, sequence={}, reason={}",
+                normalized.stream().streamId(), normalized.event().sourceOrdinal(), exception.getMessage()
+            );
+            return ApplyResult.desynchronized(normalized.stream().streamId(), exception.getMessage());
+        }
+    }
+
+    public record ApplyResult(Status status, MboBookEngine.BookSnapshot snapshot, String streamId, String reason) {
+        public enum Status {
+            IGNORED,
+            APPLIED,
+            DESYNCHRONIZED
+        }
+
+        private Optional<MboBookEngine.BookSnapshot> optionalSnapshot() {
+            return Optional.ofNullable(snapshot);
+        }
+
+        private static ApplyResult ignored() {
+            return new ApplyResult(Status.IGNORED, null, null, null);
+        }
+
+        private static ApplyResult applied(MboBookEngine.BookSnapshot snapshot, String streamId) {
+            return new ApplyResult(Status.APPLIED, snapshot, streamId, null);
+        }
+
+        private static ApplyResult desynchronized(String streamId, String reason) {
+            return new ApplyResult(Status.DESYNCHRONIZED, null, streamId, reason);
+        }
     }
 
     private Optional<NormalizedLiveUpdate> normalize(MarketEvent event) {
@@ -80,6 +146,7 @@ public final class RealtimeMboBookService {
         }
         if (side == null) side = 'N';
         if (priceNano == null) priceNano = LiveMboEvent.MISSING_PRICE_NANO;
+        Long priority = unsignedLongValue(data, "priority", "queue_priority", "queuePriority");
 
         long size = size(event.quantity(), action);
         if (size < 0) {
@@ -96,7 +163,8 @@ public final class RealtimeMboBookService {
             priceNano,
             size,
             orderId,
-            sourceSequence
+            sourceSequence,
+            priority
         );
         return Optional.of(new NormalizedLiveUpdate(
             new MboStreamKey(event.source(), streamId),
@@ -186,6 +254,21 @@ public final class RealtimeMboBookService {
                 return value.longValue();
             }
             return Long.valueOf(value.asString());
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private Long unsignedLongValue(JsonNode source, String... fields) {
+        JsonNode value = node(source, fields);
+        if (value == null) {
+            return null;
+        }
+        try {
+            if (value.isIntegralNumber()) {
+                return value.longValue();
+            }
+            return Long.parseUnsignedLong(value.asString());
         } catch (NumberFormatException ignored) {
             return null;
         }

@@ -52,6 +52,19 @@ class MboStreamProcessorTest {
         assertThat(live.snapshot(stream, 1, 750, 10).asks()).isEmpty();
     }
 
+    @Test
+    void appliesExplicitAtasPriorityChangesEvenWhenPriceAndSizeStayTheSame() {
+        MboStreamProcessor live = new MboStreamProcessor(true, 10);
+        MboStreamKey stream = new MboStreamKey("atas", "priority-stream");
+        live.accept(stream, live(0, 10, LiveMboEvent.Action.ADD, 'B', 100, 5, 10L));
+        live.accept(stream, live(1, 11, LiveMboEvent.Action.ADD, 'B', 100, 5, 20L));
+        live.accept(stream, live(2, 10, LiveMboEvent.Action.MODIFY, 'B', 100, 5, 30L));
+
+        assertThat(live.ordersAtLevel(stream, 1, 750, 'B', 100))
+            .extracting(MboBookEngine.OrderView::orderId)
+            .containsExactly(11L, 10L);
+    }
+
     private MboEvent historical(long ordinal, long orderId, char action, char side, long price, long size) {
         return new MboEvent(
             ordinal, 1_700_000_000_000_000_000L + ordinal,
@@ -72,6 +85,22 @@ class MboStreamProcessorTest {
             ordinal, 1_700_000_000_000_000_000L + ordinal,
             1_700_000_000_000_000_000L + ordinal, 1, 750,
             action, side, price, size, orderId, ordinal
+        );
+    }
+
+    private LiveMboEvent live(
+        long ordinal,
+        long orderId,
+        LiveMboEvent.Action action,
+        char side,
+        long price,
+        long size,
+        long priority
+    ) {
+        return new LiveMboEvent(
+            ordinal, 1_700_000_000_000_000_000L + ordinal,
+            1_700_000_000_000_000_000L + ordinal, 1, 750,
+            action, side, price, size, orderId, ordinal, priority
         );
     }
 }

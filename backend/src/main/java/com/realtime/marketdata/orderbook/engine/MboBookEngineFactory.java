@@ -11,7 +11,7 @@ public final class MboBookEngineFactory {
     public static final int HISTORICAL_DEPTH = MAX_DEPTH;
     public static final int LIVE_DEPTH = MAX_DEPTH;
 
-    /** 创建历史回放引擎：允许保留交叉盘，并返回最多 400 档。 */
+    /** 创建历史回放引擎：按源记录逐条应用，允许保留交叉盘，并返回最多 400 档。 */
     public MboBookEngine createHistorical() {
         return new MboBookEngine(false, HISTORICAL_DEPTH);
     }

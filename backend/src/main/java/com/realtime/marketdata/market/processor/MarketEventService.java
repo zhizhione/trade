@@ -15,7 +15,6 @@ import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -41,6 +40,7 @@ public class MarketEventService {
     private final RealtimeMboBookService realtimeMboBookService;
     private final ZoneId atasEventTimeZone;
     private final ConcurrentMap<String, SnapshotAccumulator> snapshots = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Object> streamLocks = new ConcurrentHashMap<>();
 
     public MarketEventService(
         ObjectMapper objectMapper,
@@ -133,6 +133,15 @@ public class MarketEventService {
     }
 
     private MarketSnapshot updateSnapshot(MarketEvent event) {
+        Object streamLock = streamLocks.computeIfAbsent(
+            event.source() + ":" + String.valueOf(sourceStreamId(event)), ignored -> new Object()
+        );
+        synchronized (streamLock) {
+            return updateSnapshotLocked(event);
+        }
+    }
+
+    private MarketSnapshot updateSnapshotLocked(MarketEvent event) {
         // 同一合约的不同实时连接可能各自从 sequence=0 开始；必须分开维护状态。
         SnapshotAccumulator state = snapshots.computeIfAbsent(snapshotKey(event), ignored -> new SnapshotAccumulator());
         synchronized (state) {
@@ -144,11 +153,25 @@ public class MarketEventService {
             }
 
             JsonNode data = event.data();
-            Optional<MboBookEngine.BookSnapshot> rebuiltBook = realtimeMboBookService.apply(event);
-            if (rebuiltBook.isPresent()) {
-                updateDepth(state, rebuiltBook.get());
-            } else {
-                updateDepth(state, data);
+            RealtimeMboBookService.ApplyResult rebuiltBook = realtimeMboBookService.applyDetailed(event);
+            switch (rebuiltBook.status()) {
+                case APPLIED -> updateDepth(state, rebuiltBook.snapshot());
+                case DESYNCHRONIZED -> {
+                    // Never retain a stale incremental book after a lifecycle/ordering error.
+                    // The raw event is still saved and the stream will rebuild after reconnect.
+                    clearStreamSnapshots(event.source(), rebuiltBook.streamId());
+                    state.bids = List.of();
+                    state.asks = List.of();
+                }
+                case IGNORED -> {
+                    // Once an ATAS incremental stream is quarantined, malformed follow-up
+                    // messages must not smuggle an aggregate depth payload back into the UI.
+                    // Only a new stream/reset is allowed to repopulate that book.
+                    String streamId = sourceStreamId(event);
+                    if (!realtimeMboBookService.isDesynchronized(streamId)) {
+                        updateDepth(state, data);
+                    }
+                }
             }
 
             BigDecimal explicitOrderFlow = parseDecimal(firstNode(data, "orderFlow", "order_flow", "imbalance"));
@@ -374,6 +397,23 @@ public class MarketEventService {
         );
     }
 
+    private void clearStreamSnapshots(String source, String streamId) {
+        if (source == null || streamId == null) {
+            return;
+        }
+        String suffix = ":" + streamId;
+        snapshots.forEach((key, value) -> {
+            if (key.startsWith(source + ":") && key.endsWith(suffix)) {
+                // This method is called while the triggering accumulator is locked. Taking
+                // additional accumulator locks here can deadlock two contracts desynchronizing
+                // concurrently (A -> B, B -> A). Depth fields are volatile and replaced atomically,
+                // so clearing without nested locks safely removes stale visible depth.
+                value.bids = List.of();
+                value.asks = List.of();
+            }
+        });
+    }
+
     private String sourceStreamId(MarketEvent event) {
         return firstText(event.data(), "source_stream_id", "sourceStreamId", "stream_id", "streamId");
     }
@@ -418,8 +458,8 @@ public class MarketEventService {
     private static final class SnapshotAccumulator {
         private Instant eventTime;
         private BigDecimal lastPrice;
-        private List<DepthLevel> bids = List.of();
-        private List<DepthLevel> asks = List.of();
+        private volatile List<DepthLevel> bids = List.of();
+        private volatile List<DepthLevel> asks = List.of();
         private BigDecimal orderFlow = ZERO;
         private BigDecimal signalValue = ZERO;
         private String lastEventType;

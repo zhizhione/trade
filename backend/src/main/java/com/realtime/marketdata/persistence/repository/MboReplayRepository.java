@@ -84,6 +84,7 @@ public class MboReplayRepository implements MboReplayEventSource {
         SELECT toString(catalog.file_sha256),
                min(coalesce(catalog.min_ts_event, catalog.first_ts_event)) AS min_ts_event,
                max(coalesce(catalog.max_ts_event, catalog.last_ts_event)) AS max_ts_event,
+               max(catalog.decoded_rows) AS decoded_rows,
                max(catalog.last_source_ordinal) AS last_source_ordinal
         FROM market_data.databento_mbo_file_catalog AS catalog FINAL
         WHERE catalog.status = 'completed'
@@ -238,13 +239,16 @@ public class MboReplayRepository implements MboReplayEventSource {
                     boolean minWasNull = rows.wasNull();
                     long maxTsEvent = rows.getLong(3);
                     boolean maxWasNull = rows.wasNull();
-                    long lastSourceOrdinal = rows.getLong(4);
+                    long decodedRows = rows.getLong(4);
+                    Long decodedRowsValue = rows.wasNull() ? null : decodedRows;
+                    long lastSourceOrdinal = rows.getLong(5);
                     Long lastSourceOrdinalValue = rows.wasNull() ? null : lastSourceOrdinal;
                     if (!minWasNull && !maxWasNull) {
                         catalogRanges.add(new CatalogRange(
                             rows.getString(1).replace("\0", ""),
                             minTsEvent,
                             maxTsEvent,
+                            decodedRowsValue,
                             lastSourceOrdinalValue
                         ));
                     }
@@ -279,16 +283,18 @@ public class MboReplayRepository implements MboReplayEventSource {
             for (int index = streamStart; index <= lastOverlap; index++) {
                 CatalogRange catalogRange = catalogRanges.get(index);
                 ranges.add(new FileRange(
-                    catalogRange.fileSha256(), catalogRange.lastSourceOrdinal()
+                    catalogRange.fileSha256(), catalogRange.decodedRows(), catalogRange.lastSourceOrdinal()
                 ));
             }
 
+            // source_ordinal restarts at zero for every DBN file.  The base is therefore a
+            // property of the file's position in the catalog, not of the warmup reset chosen
+            // for this particular request.  In particular, a continuation cursor may point at
+            // a file containing its own R record; recomputing from warmupStart in that case would
+            // assign a smaller ordinal to the continuation events than the first chunk used.
             long ordinalBase = 0;
-            for (int index = warmupStart; index < streamStart; index++) {
-                Long lastSourceOrdinal = catalogRanges.get(index).lastSourceOrdinal();
-                if (lastSourceOrdinal != null) {
-                    ordinalBase += lastSourceOrdinal + 1;
-                }
+            for (int index = 0; index < streamStart; index++) {
+                ordinalBase += fileOrdinalSpan(catalogRanges.get(index));
             }
             long previousEventNs = cursor == null ? Long.MIN_VALUE : Long.parseLong(cursor.lastEventNs());
             long streamedEvents = 0L;
@@ -326,11 +332,7 @@ public class MboReplayRepository implements MboReplayEventSource {
                 previousEventNs = Math.max(previousEventNs, result.lastEventNs());
                 // 磁盘上的 source_ordinal 是 UInt64。Java 以 long 保存其位模式，递增时必须
                 // 使用无符号语义；Math.addExact 会错误拒绝最高位为 1 的合法顺序号。
-                if (range.lastSourceOrdinal() != null) {
-                    ordinalBase += range.lastSourceOrdinal() + 1;
-                } else if (result.hasSourceOrdinal()) {
-                    ordinalBase += result.maxSourceOrdinal() + 1;
-                }
+                ordinalBase += fileOrdinalSpan(range, result);
             }
             log.info(
                 "Replay event stream complete: publisherId={}, instrumentId={}, files={}, events={}, elapsedMs={}",
@@ -445,6 +447,26 @@ public class MboReplayRepository implements MboReplayEventSource {
         return new FileStreamResult(true, maxSourceOrdinal, hasSourceOrdinal, lastEventNs, streamedEvents);
     }
 
+    private long fileOrdinalSpan(CatalogRange range) {
+        if (range.decodedRows() != null && range.decodedRows() > 0) {
+            return range.decodedRows();
+        }
+        throw new ReplayDataAccessException(
+            "Replay catalog is missing decoded_rows for file " + shortSha(range.fileSha256())
+                + "; run the MBO catalog backfill before replay"
+        );
+    }
+
+    private long fileOrdinalSpan(FileRange range, FileStreamResult result) {
+        if (range.decodedRows() != null && range.decodedRows() > 0) {
+            return range.decodedRows();
+        }
+        throw new ReplayDataAccessException(
+            "Replay catalog is missing decoded_rows for file " + shortSha(range.fileSha256())
+                + "; run the MBO catalog backfill before replay"
+        );
+    }
+
     @Override
     public String symbol(int publisherId, long instrumentId) {
         return "instrument-" + instrumentId;
@@ -517,6 +539,7 @@ public class MboReplayRepository implements MboReplayEventSource {
 
     private record FileRange(
         String fileSha256,
+        Long decodedRows,
         Long lastSourceOrdinal
     ) {
     }
@@ -525,6 +548,7 @@ public class MboReplayRepository implements MboReplayEventSource {
         String fileSha256,
         long minTsEvent,
         long maxTsEvent,
+        Long decodedRows,
         Long lastSourceOrdinal
     ) {
     }

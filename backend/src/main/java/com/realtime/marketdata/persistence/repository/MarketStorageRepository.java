@@ -140,8 +140,15 @@ public class MarketStorageRepository implements MarketEventStore {
         Long sequence = requiredSequence(event);
         BigDecimal price = requiredDecimal(event, "price", "px");
         Long volume = requiredUnsigned(event, "volume", "quantity", "qty", "size");
-        if (streamId == null || canonicalId == null || sequence == null || price == null || volume == null) {
-            log.warn("Skipping incomplete ATAS MBO event {}: source stream, canonical_id, sequence, price and volume are required", event.eventId());
+        String updateType = text(event, "update_type", "updateType", "action", "type");
+        boolean delete = isDeleteAction(updateType);
+        Long orderId = requiredUnsigned(event, "exchange_order_id", "exchangeOrderId", "order_id", "orderId");
+        if (streamId == null || canonicalId == null || sequence == null || orderId == null
+            || (!delete && (price == null || volume == null))) {
+            log.warn(
+                "Skipping incomplete ATAS MBO event {}: source stream, canonical_id, sequence and order_id are required; price/volume are required except for Delete",
+                event.eventId()
+            );
             return;
         }
 
@@ -167,11 +174,16 @@ public class MarketStorageRepository implements MarketEventStore {
             statement.setString(12, textOrDefault(event, "Unknown", "update_type", "updateType", "action", "type"));
             statement.setString(13, textOrDefault(event, "Unknown", "side"));
             statement.setLong(14, unsignedOrDefault(event, 0, "priority"));
-            statement.setLong(15, unsignedOrDefault(event, 0, "exchange_order_id", "exchangeOrderId", "order_id", "orderId"));
-            statement.setBigDecimal(16, price);
-            statement.setLong(17, priceNano(event, price));
-            statement.setLong(18, volume);
+            statement.setLong(15, orderId);
+            setNullableDecimal(statement, 16, price);
+            setNullableLong(statement, 17, price == null ? null : priceNano(event, price));
+            setNullableLong(statement, 18, volume);
         });
+    }
+
+    private boolean isDeleteAction(String value) {
+        return value != null && ("delete".equalsIgnoreCase(value)
+            || "remove".equalsIgnoreCase(value) || "d".equalsIgnoreCase(value));
     }
 
     private void saveAtasTrade(MarketEvent event) {

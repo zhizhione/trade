@@ -96,51 +96,54 @@ class MboBookEngineTest {
     }
 
     @Test
-    void strictModeRejectsCrossedBookButAuditModeRetainsItsMarker() {
-        MboBookEngine strict = new MboBookEngine();
-        strict.apply(event(0, 101, 'A', 'B', 100, 1, 0));
-        assertThatThrownBy(() -> strict.apply(event(1, 201, 'A', 'A', 100, 1, MboBookEngine.F_LAST)))
-            .isInstanceOf(MboBookInvariantException.class)
-            .hasMessageContaining("crossed book");
-
-        MboBookEngine audit = new MboBookEngine(false);
-        audit.apply(event(0, 101, 'A', 'B', 100, 1, 0));
-        assertThat(audit.apply(event(1, 201, 'A', 'A', 100, 1, MboBookEngine.F_LAST)))
+    void historicalModeRetainsCrossedBookMarkerWithoutStrictTransaction() {
+        MboBookEngine engine = new MboBookEngine();
+        engine.apply(event(0, 101, 'A', 'B', 100, 1, 0));
+        assertThat(engine.apply(event(1, 201, 'A', 'A', 100, 1, MboBookEngine.F_LAST)))
             .get()
             .extracting(MboBookEngine.BookSnapshot::crossed)
             .isEqualTo(true);
     }
 
     @Test
-    void rejectedCrossingDoesNotMutateTheStrictBook() {
+    void historicalCrossingDoesNotUseStrictRollback() {
         MboBookEngine engine = new MboBookEngine();
         engine.apply(event(0, 101, 'A', 'B', 100, 1, MboBookEngine.F_LAST));
-
-        assertThatThrownBy(() -> engine.apply(event(1, 201, 'A', 'A', 100, 1, MboBookEngine.F_LAST)))
-            .isInstanceOf(MboBookInvariantException.class);
-
-        assertThat(engine.snapshot(1, 750, 10).asks()).isEmpty();
+        assertThat(engine.apply(event(1, 201, 'A', 'A', 100, 1, MboBookEngine.F_LAST))).isPresent();
+        assertThat(engine.snapshot(1, 750, 10).asks())
+            .containsExactly(new MboBookEngine.Level(100, 1, 1));
         assertThat(engine.snapshot(1, 750, 10).bids())
             .containsExactly(new MboBookEngine.Level(100, 1, 1));
     }
 
     @Test
-    void rejectedMessageRollsBackAllOfItsHistoricalRecords() {
+    void historicalMessageStateIsAppliedAsRecordsArrive() {
         MboBookEngine engine = new MboBookEngine();
         engine.apply(event(0, 101, 'A', 'B', 100, 1, MboBookEngine.F_LAST));
 
         assertThat(engine.apply(event(1, 201, 'A', 'A', 100, 1, 0))).isEmpty();
-        assertThatThrownBy(() -> engine.apply(event(2, 0, 'N', 'N', 0, 0, MboBookEngine.F_LAST)))
-            .isInstanceOf(MboBookInvariantException.class)
-            .hasMessageContaining("crossed book");
-
-        assertThat(engine.snapshot(1, 750, 10).asks()).isEmpty();
+        assertThat(engine.apply(event(2, 0, 'N', 'N', 0, 0, MboBookEngine.F_LAST))).isPresent();
+        assertThat(engine.snapshot(1, 750, 10).asks())
+            .containsExactly(new MboBookEngine.Level(100, 1, 1));
         assertThat(engine.snapshot(1, 750, 10).bids())
             .containsExactly(new MboBookEngine.Level(100, 1, 1));
         assertThat(engine.apply(event(3, 202, 'A', 'A', 101, 1, MboBookEngine.F_LAST)))
             .get()
             .extracting(MboBookEngine.BookSnapshot::crossed)
-            .isEqualTo(false);
+            .isEqualTo(true);
+    }
+
+    @Test
+    void commitsInterleavedHistoricalMessagesPerInstrument() {
+        MboBookEngine engine = new MboBookEngine();
+        engine.apply(eventForInstrument(0, 750, 101, 'A', 'B', 100, 1, 0));
+        engine.apply(eventForInstrument(1, 751, 201, 'A', 'A', 110, 2, 0));
+
+        assertThat(engine.apply(eventForInstrument(2, 750, 0, 'N', 'N', 0, 0, MboBookEngine.F_LAST)))
+            .isPresent();
+
+        assertThat(engine.snapshot(1, 751, 10).asks())
+            .containsExactly(new MboBookEngine.Level(110, 2, 1));
     }
 
     @Test

@@ -29,10 +29,26 @@ class MarketStorageRepositoryTest {
         capture.repository().save(event("mbo", """
             {"source":"atas","source_stream_id":"7e5d13a2-f68c-4a98-9fc2-986cba9753d1",
              "source_sequence":1,"canonical_id":1001,"price":23456.25,"volume":7,
-             "type":"New","side":"Bid"}
+             "type":"New","side":"Bid","exchange_order_id":76}
             """));
 
         assertThat(capture.sql()).singleElement().asString().contains("market_data.atas_mbo_raw");
+    }
+
+    @Test
+    void persistsAtasDeleteWithOnlyOrderIdentity() throws Exception {
+        Capture capture = captureStatements();
+
+        capture.repository().save(event("mbo", """
+            {"source":"atas","source_stream_id":"7e5d13a2-f68c-4a98-9fc2-986cba9753d1",
+             "source_sequence":3,"canonical_id":1001,"type":"Delete",
+             "exchange_order_id":77}
+            """));
+
+        assertThat(capture.sql()).singleElement().asString()
+            .contains("market_data.atas_mbo_raw")
+            .contains("price_nano")
+            .contains("volume");
     }
 
     @Test
