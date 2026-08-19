@@ -18,6 +18,13 @@ export interface ReplayDepthLevel {
   orderCount: number;
 }
 
+export interface ReplayCursor {
+  fileSha256: string;
+  /** 游标数值以字符串传输，避免 JavaScript 丢失纳秒级整数精度。 */
+  sourceOrdinal: string;
+  lastEventNs: string;
+}
+
 export interface ReplayFrame {
   /** 采样桶起点的绝对 Unix 毫秒时间。 */
   timeMs: number;
@@ -77,7 +84,16 @@ export type ReplayStreamMessage =
   | { type: 'replay_ready'; payload: ReplayStreamReady }
   | { type: 'replay_frame'; payload: ReplayFrame }
   | { type: 'replay_bar'; payload: ReplayBar }
-  | { type: 'replay_complete'; payload: { startMs: number; endMs: number; truncated?: boolean } }
+  | {
+      type: 'replay_complete';
+      payload: {
+        startMs: number;
+        endMs: number;
+        truncated?: boolean;
+        hasNext?: boolean;
+        nextCursor?: ReplayCursor;
+      };
+    }
   | { type: 'replay_error'; payload: { message: string } };
 
 export type ReplayStreamStatus = 'connecting' | 'connected' | 'disconnected';

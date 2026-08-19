@@ -179,8 +179,8 @@ Java 状态机中逐条处理。`F_LAST` 仅用于确认一条 DBN 消息完成�
 为保证窗口起点的队列状态正确，后端会从首个相交文件向前查找最近的 `R` reset，并从该文件开始处理预热事件；
 预热事件不会推送给浏览器。找不到 reset 时会拒绝回放，避免输出不完整订单簿。服务端按前端选定的秒数在线聚合中间价 OHLC；无需再预先返回固定数量的快照或由前端本地计时播放。
 
-在线回放会保留交叉盘并标记 `crossed=true`，便于诊断源数据；前端不把它当作有效当前价，策略和回测必须显式过滤
-`!complete` 或 `crossed` 帧。单个 WebSocket 请求最多推送 6,000 个可见时间桶帧，超过后页面会提示缩小时间范围。
+在线回放始终按 `source_ordinal` 处理；`ts_event` 回退不会再导致原始事件被丢弃。回放会保留交叉盘并标记 `crossed=true`，便于诊断源数据；前端不把它当作有效当前价，策略和回测必须显式过滤
+`!complete` 或 `crossed` 帧。单个 WebSocket 分段最多推送 20,000 个可见时间桶帧；分段结束时服务端返回文件哈希、原始序号和事件时间游标，客户端自动发送 `replay_continue` 继续读取，只有到达请求结束时间才结束整次回放。
 
 ### 6. 启动后端
 
@@ -312,6 +312,7 @@ raw 提交、目录写入和 job 完成不是一个 ClickHouse 跨表事务。�
 
 实时 ATAS 动作映射为 `New -> ADD`、`Change -> MODIFY`、`Delete -> DELETE`。其中历史 Databento
 `C` 的 `size` 是撤单量，而 ATAS `Delete` 没有撤单增量语义，状态机直接移除该活动订单的全部剩余量。
+如果 ATAS Delete 只提供 `order_id`，状态机也会按活动订单索引删除，不会静默忽略该更新。
 
 只在带 `F_LAST` 的记录后输出状态，避免观察 publisher message 的中间态。输入若带已经派生的
 `F_TOB` / `F_MBP` 标志会被拒绝，防止把 BBO/MBP 记录误当 MBO 再重建。
@@ -326,13 +327,14 @@ raw 提交、目录写入和 job 完成不是一个 ClickHouse 跨表事务。�
 ```text
 GET /api/replay/catalog
 GET /api/replay/session?publisherId=...&instrumentId=...&bucketMs=100
-                        &startMs=...&endMs=...&limit=6000&barIntervalMs=1000&diagnostic=false
+                        &startMs=...&endMs=...&limit=20000&barIntervalMs=1000&diagnostic=false
 WS  /ws/replay
 ```
 
 `/api/replay/session` 保留给调试和批量检查。页面使用 `/ws/replay`：客户端发送 `replay_start`、
-`replay_play`、`replay_pause`、`replay_speed`、`replay_stop`；服务端发送 `replay_ready`、
-`replay_frame`、`replay_bar`、`replay_complete` 或 `replay_error`。
+`replay_play`、`replay_pause`、`replay_speed`、`replay_continue`、`replay_stop`；服务端发送 `replay_ready`、
+`replay_frame`、`replay_bar`、`replay_complete` 或 `replay_error`。`replay_complete.payload.hasNext=true` 时，
+`nextCursor` 必须原样回传给 `replay_continue`；游标中的大整数以字符串传输。
 
 回放页面展示：
 
@@ -340,7 +342,7 @@ WS  /ws/replay
 - DOM 当前买卖盘口（普通模式每侧最多 100 档，诊断模式最多 400 档），包含每档数量和订单数。
 - 右侧当前快照的最多 400 档价格深度，以及回放至当前帧的挂单变化提示。
 - BBO、400 档深度不平衡、完整性和交叉盘状态。
-- 播放、暂停、单步、倍速和已接收帧的时间轴跳转。单次请求超过 6,000 帧时需要拆分时间范围。
+- 播放、暂停、单步、倍速和已接收帧的时间轴跳转。每段超过 20,000 帧时由客户端自动续播，时间轴只维护当前窗口以避免重复复制完整帧数组。
 
 ## 文件目录回填
 
@@ -626,4 +628,6 @@ DROP TABLE market_data.databento_mbo_raw SYNC;
 2. 从 L3/L2 快照派生 BBO、spread、microprice、imbalance、OFI、撤单率和队列特征。
 3. 建立特征注册表、版本、窗口和数据质量 lineage。
 4. 实现事件驱动回测器，并强制过滤 incomplete/crossed/缺口窗口。
-5. 用官方 MBP/BBO 数据做 `F_LAST` 边界差异验证，再扩大到全年策略研究。
+5. 用官方 MBP/BBO 数据做 `F_LAST` 边界差异验证，再扩大到全年策略研究。当前可用独立校验器复跑同日对账：
+   `python/.venv/bin/python python/validate_mbo_against_official.py --mbo <同日.mbo.dbn.zst> --mbp10 <同日.mbp-10.dbn.zst> --tbbo <同日.tbbo.dbn.zst>`。
+   对齐键为 `(sequence, ts_event)`，并按 `action + price + size` 处理 MBP-10 对十档外 MBO 事件的省略。

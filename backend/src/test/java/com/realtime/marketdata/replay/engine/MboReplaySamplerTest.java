@@ -7,6 +7,7 @@ import com.realtime.marketdata.mbo.model.MboEvent;
 import com.realtime.marketdata.orderbook.engine.MboBookEngine;
 import com.realtime.marketdata.orderbook.engine.MboBookInvariantException;
 import com.realtime.marketdata.replay.model.ReplayFrame;
+import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
@@ -45,13 +46,43 @@ class MboReplaySamplerTest {
     }
 
     @Test
-    void rejectsFLastTimeRegressionForTheSameBook() {
+    void foldsEventTimeRegressionIntoTheLatestSourceOrderedBucket() {
         MboReplaySampler sampler = new MboReplaySampler(100, 10, false);
         sampler.accept(event(0, 200_000_000, 1, 'R', 'N', 0, 0, MboBookEngine.F_LAST));
 
-        assertThatThrownBy(() -> sampler.accept(event(1, 100_000_000, 2, 'N', 'N', 0, 0, MboBookEngine.F_LAST)))
-            .isInstanceOf(MboBookInvariantException.class)
-            .hasMessageContaining("timestamp regressed");
+        sampler.accept(event(1, 100_000_000, 2, 'N', 'N', 0, 0, MboBookEngine.F_LAST));
+
+        assertThat(sampler.finish()).singleElement().satisfies(frame -> {
+            assertThat(frame.timeMs()).isEqualTo(200L);
+            assertThat(frame.sourceOrdinal()).isEqualTo(1L);
+        });
+    }
+
+    @Test
+    void doesNotRecreateAnAlreadyEmittedBucketWhenEventTimeRegresses() {
+        MboReplaySampler sampler = new MboReplaySampler(100, 10, false);
+        List<ReplayFrame> emitted = new ArrayList<>();
+        emitted.addAll(sampler.accept(event(0, 0, 1, 'R', 'N', 0, 0, MboBookEngine.F_LAST)));
+        emitted.addAll(sampler.accept(event(1, 100_000_000, 2, 'N', 'N', 0, 0, MboBookEngine.F_LAST)));
+        emitted.addAll(sampler.accept(event(2, 0, 3, 'N', 'N', 0, 0, MboBookEngine.F_LAST)));
+        emitted.addAll(sampler.finish());
+
+        assertThat(emitted).extracting(ReplayFrame::timeMs).containsExactly(0L, 100L);
+        assertThat(emitted).extracting(ReplayFrame::sourceOrdinal).containsExactly(0L, 2L);
+    }
+
+    @Test
+    void ordersFinishedFramesUsingUnsignedSourceOrdinals() {
+        MboReplaySampler sampler = new MboReplaySampler(100, 10, false);
+        sampler.accept(eventForInstrument(
+            Long.MAX_VALUE, 0, 750, 1, 'R', 'N', 0, 0, MboBookEngine.F_LAST
+        ));
+        sampler.accept(eventForInstrument(
+            Long.MIN_VALUE, 0, 751, 2, 'R', 'N', 0, 0, MboBookEngine.F_LAST
+        ));
+
+        assertThat(sampler.finish()).extracting(ReplayFrame::sourceOrdinal)
+            .containsExactly(Long.MAX_VALUE, Long.MIN_VALUE);
     }
 
     @Test
@@ -80,9 +111,23 @@ class MboReplaySamplerTest {
     private MboEvent event(
         long ordinal, long tsEventNs, long orderId, char action, char side, long price, long size, int flags
     ) {
+        return eventForInstrument(ordinal, tsEventNs, 750, orderId, action, side, price, size, flags);
+    }
+
+    private MboEvent eventForInstrument(
+        long ordinal,
+        long tsEventNs,
+        long instrumentId,
+        long orderId,
+        char action,
+        char side,
+        long price,
+        long size,
+        int flags
+    ) {
         return new MboEvent(
-            ordinal, tsEventNs + 1, tsEventNs, 160, 1, 750, action, side,
-            price, size, 0, orderId, flags, 0, ordinal
+            ordinal, tsEventNs + 1, tsEventNs, 160, 1, instrumentId, action, side,
+            price, size, 0, orderId, flags, 0, 0
         );
     }
 }

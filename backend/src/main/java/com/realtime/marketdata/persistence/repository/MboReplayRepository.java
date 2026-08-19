@@ -2,6 +2,7 @@ package com.realtime.marketdata.persistence.repository;
 
 import com.realtime.marketdata.mbo.model.MboEvent;
 import com.realtime.marketdata.replay.model.ReplayCatalogEntry;
+import com.realtime.marketdata.replay.model.ReplayCursor;
 import com.realtime.marketdata.replay.source.ReplayDataAccessException;
 import com.realtime.marketdata.replay.source.MboReplayEventSource;
 import com.zaxxer.hikari.HikariConfig;
@@ -57,6 +58,17 @@ public class MboReplayRepository implements MboReplayEventSource {
         WHERE publisher_id = ?
           AND instrument_id = ?
           AND ts_event <= ?
+        ORDER BY source_ordinal
+        """;
+    private static final String RAW_EVENTS_AFTER_CURSOR_SQL = """
+        SELECT source_ordinal, ts_recv, ts_event, rtype, publisher_id, instrument_id,
+               action, side, price, size, channel_id, order_id, flags, ts_in_delta, sequence
+        FROM market_data.databento_mbo_raw FINAL
+        PREWHERE file_sha256 = toFixedString(?, 64)
+        WHERE publisher_id = ?
+          AND instrument_id = ?
+          AND ts_event <= ?
+          AND source_ordinal > ?
         ORDER BY source_ordinal
         """;
     private static final String RESET_ORDINAL_SQL = """
@@ -194,6 +206,18 @@ public class MboReplayRepository implements MboReplayEventSource {
         long endMs,
         MboEventConsumer consumer
     ) {
+        return streamEvents(publisherId, instrumentId, startMs, endMs, null, consumer).completed();
+    }
+
+    @Override
+    public StreamResult streamEvents(
+        int publisherId,
+        long instrumentId,
+        long startMs,
+        long endMs,
+        ReplayCursor cursor,
+        MboEventConsumer consumer
+    ) {
         Objects.requireNonNull(consumer, "consumer");
         requireEnabled();
         long startNs = Math.multiplyExact(startMs, 1_000_000L);
@@ -241,13 +265,18 @@ public class MboReplayRepository implements MboReplayEventSource {
                     "Replay event stream has no overlapping files: publisherId={}, instrumentId={}, elapsedMs={}",
                     publisherId, instrumentId, elapsedMs(startedNanos)
                 );
-                return true;
+                return new StreamResult(true, null);
+            }
+            int cursorIndex = cursor == null ? -1 : findCursorIndex(catalogRanges, cursor.fileSha256());
+            if (cursor != null && cursorIndex < 0) {
+                throw new ReplayDataAccessException("Replay cursor file is no longer available: " + cursor.fileSha256());
             }
             int warmupStart = findWarmupStart(
-                connection, catalogRanges, firstOverlap, publisherId, instrumentId
+                connection, catalogRanges, cursorIndex >= 0 ? cursorIndex : firstOverlap, publisherId, instrumentId
             );
+            int streamStart = cursorIndex >= 0 ? cursorIndex : warmupStart;
             List<FileRange> ranges = new ArrayList<>();
-            for (int index = warmupStart; index <= lastOverlap; index++) {
+            for (int index = streamStart; index <= lastOverlap; index++) {
                 CatalogRange catalogRange = catalogRanges.get(index);
                 ranges.add(new FileRange(
                     catalogRange.fileSha256(), catalogRange.lastSourceOrdinal()
@@ -255,9 +284,19 @@ public class MboReplayRepository implements MboReplayEventSource {
             }
 
             long ordinalBase = 0;
-            long previousEventNs = Long.MIN_VALUE;
+            for (int index = warmupStart; index < streamStart; index++) {
+                Long lastSourceOrdinal = catalogRanges.get(index).lastSourceOrdinal();
+                if (lastSourceOrdinal != null) {
+                    ordinalBase += lastSourceOrdinal + 1;
+                }
+            }
+            long previousEventNs = cursor == null ? Long.MIN_VALUE : Long.parseLong(cursor.lastEventNs());
             long streamedEvents = 0L;
-            for (FileRange range : ranges) {
+            for (int rangeIndex = 0; rangeIndex < ranges.size(); rangeIndex++) {
+                FileRange range = ranges.get(rangeIndex);
+                Long afterSourceOrdinal = cursor != null && rangeIndex == 0
+                    ? Long.parseUnsignedLong(cursor.sourceOrdinal())
+                    : null;
                 FileStreamResult result = streamFile(
                     connection,
                     range,
@@ -266,6 +305,7 @@ public class MboReplayRepository implements MboReplayEventSource {
                     endNs,
                     ordinalBase,
                     previousEventNs,
+                    afterSourceOrdinal,
                     consumer
                 );
                 streamedEvents += result.streamedEvents();
@@ -274,7 +314,14 @@ public class MboReplayRepository implements MboReplayEventSource {
                         "Replay event stream stopped by consumer: publisherId={}, instrumentId={}, files={}, events={}, elapsedMs={}",
                         publisherId, instrumentId, ranges.size(), streamedEvents, elapsedMs(startedNanos)
                     );
-                    return false;
+                    return new StreamResult(
+                        false,
+                        new ReplayCursor(
+                            range.fileSha256(),
+                            Long.toUnsignedString(result.maxSourceOrdinal()),
+                            Long.toString(result.lastEventNs())
+                        )
+                    );
                 }
                 previousEventNs = Math.max(previousEventNs, result.lastEventNs());
                 // 磁盘上的 source_ordinal 是 UInt64。Java 以 long 保存其位模式，递增时必须
@@ -289,7 +336,7 @@ public class MboReplayRepository implements MboReplayEventSource {
                 "Replay event stream complete: publisherId={}, instrumentId={}, files={}, events={}, elapsedMs={}",
                 publisherId, instrumentId, ranges.size(), streamedEvents, elapsedMs(startedNanos)
             );
-            return true;
+            return new StreamResult(true, null);
         } catch (SQLException exception) {
             log.error(
                 "Replay event stream failed: publisherId={}, instrumentId={}, startMs={}, endMs={}, elapsedMs={}",
@@ -297,6 +344,15 @@ public class MboReplayRepository implements MboReplayEventSource {
             );
             throw replayQueryFailure("stream raw MBO replay events", exception);
         }
+    }
+
+    private int findCursorIndex(List<CatalogRange> ranges, String fileSha256) {
+        for (int index = 0; index < ranges.size(); index++) {
+            if (ranges.get(index).fileSha256().equals(fileSha256)) {
+                return index;
+            }
+        }
+        return -1;
     }
 
     private int findWarmupStart(
@@ -341,6 +397,7 @@ public class MboReplayRepository implements MboReplayEventSource {
         long endNs,
         long ordinalBase,
         long previousEventNs,
+        Long afterSourceOrdinal,
         MboEventConsumer consumer
     ) throws SQLException {
         long maxSourceOrdinal = 0L;
@@ -351,11 +408,15 @@ public class MboReplayRepository implements MboReplayEventSource {
             "Replay file read started: file={}, publisherId={}, instrumentId={}, ordinalBase={}",
             shortSha(range.fileSha256()), publisherId, instrumentId, ordinalBase
         );
-        try (PreparedStatement statement = connection.prepareStatement(RAW_EVENTS_SQL)) {
+        String sql = afterSourceOrdinal == null ? RAW_EVENTS_SQL : RAW_EVENTS_AFTER_CURSOR_SQL;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, range.fileSha256());
             statement.setInt(2, publisherId);
             statement.setLong(3, instrumentId);
             statement.setLong(4, endNs);
+            if (afterSourceOrdinal != null) {
+                statement.setLong(5, afterSourceOrdinal);
+            }
             statement.setFetchSize(FETCH_SIZE);
             try (ResultSet rows = statement.executeQuery()) {
                 while (rows.next()) {
@@ -366,11 +427,6 @@ public class MboReplayRepository implements MboReplayEventSource {
                         hasSourceOrdinal = true;
                     }
                     MboEvent next = event(rows, ordinalBase);
-                    // 日度 DBN 文件可能重复更早时间戳的初始订单簿记录。首文件已建立状态后，
-                    // 忽略这些重复记录，保持采样器的时间桶单调递增。
-                    if (next.tsEventNs() <= previousEventNs) {
-                        continue;
-                    }
                     lastEventNs = next.tsEventNs();
                     streamedEvents += 1;
                     if (!consumer.accept(next)) {

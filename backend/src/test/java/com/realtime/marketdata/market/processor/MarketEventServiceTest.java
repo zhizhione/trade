@@ -173,6 +173,35 @@ class MarketEventServiceTest {
     }
 
     @Test
+    void deletesAtasOrderByIdWhenDeleteOmitsSideAndPrice() throws Exception {
+        MarketStorageRepository storage = mock(MarketStorageRepository.class);
+        MarketWebSocketHandler socket = mock(MarketWebSocketHandler.class);
+        MarketEventService service = new MarketEventService(
+            JsonMapper.builder().findAndAddModules().build(),
+            storage,
+            socket,
+            new RealtimeMboBookService(),
+            "America/Chicago"
+        );
+        String stream = "delete-without-price";
+
+        service.process("market.mbo", """
+            {"source":"atas","source_stream_id":"%s","source_sequence":0,
+             "event_time":"2026-08-09T09:30:00","type":"New","side":"Ask",
+             "price":23456.50,"volume":8,"exchange_order_id":201,"canonical_id":42004177}
+            """.formatted(stream));
+        service.process("market.mbo", """
+            {"source":"atas","source_stream_id":"%s","source_sequence":1,
+             "event_time":"2026-08-09T09:30:01","type":"Delete",
+             "exchange_order_id":201,"canonical_id":42004177}
+            """.formatted(stream));
+
+        ArgumentCaptor<MarketSnapshot> snapshots = ArgumentCaptor.forClass(MarketSnapshot.class);
+        verify(socket, times(2)).broadcastSnapshot(snapshots.capture());
+        assertThat(snapshots.getAllValues().getLast().asks()).isEmpty();
+    }
+
+    @Test
     void limitsNonMboDepthSnapshotsToFourHundredLevels() throws Exception {
         MarketStorageRepository storage = mock(MarketStorageRepository.class);
         MarketWebSocketHandler socket = mock(MarketWebSocketHandler.class);

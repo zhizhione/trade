@@ -40,6 +40,7 @@ app:
     interval-ms: ${MARKET_SIMULATOR_INTERVAL_MS:500}
   atas:
     event-time-zone: ${ATAS_EVENT_TIME_ZONE:America/Chicago}
+    mbo-stream-eviction-ms: ${ATAS_MBO_STREAM_EVICTION_MS:300000}
   storage:
     clickhouse:
       enabled: ${CLICKHOUSE_ENABLED:false}

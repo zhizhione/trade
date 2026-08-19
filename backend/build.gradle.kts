@@ -42,3 +42,11 @@ dependencies {
 tasks.withType<Test> {
     useJUnitPlatform()
 }
+
+tasks.register<JavaExec>("officialOrderBookAudit") {
+    group = "verification"
+    description = "Runs the Java MboBookEngine official MBP-10/TBBO audit line protocol"
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.realtime.marketdata.orderbook.audit.OfficialOrderBookAuditMain")
+    standardInput = System.`in`
+}

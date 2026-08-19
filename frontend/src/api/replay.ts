@@ -16,7 +16,7 @@ export function loadReplaySession(
   entry: ReplayCatalogEntry,
   startMs: number,
   endMs: number,
-  limit = 6000,
+  limit = 20000,
   barIntervalMs = 1000,
   diagnostic = false,
 ): Promise<ReplaySession> {

@@ -21,6 +21,8 @@ public record LiveMboEvent(
     long orderId,
     long sequence
 ) {
+    /** Sentinel used by delete updates when the provider omits side or price. */
+    public static final long MISSING_PRICE_NANO = Long.MIN_VALUE;
     /**
      * {@code DELETE} 与 {@code CANCEL} 被有意区分：ATAS 等供应商可以发送“删除订单”而
      * 不给出本次撤销量。对于 DELETE，引擎会直接移除该活跃订单的全部剩余数量。

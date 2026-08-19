@@ -112,6 +112,38 @@ class MboBookEngineTest {
     }
 
     @Test
+    void rejectedCrossingDoesNotMutateTheStrictBook() {
+        MboBookEngine engine = new MboBookEngine();
+        engine.apply(event(0, 101, 'A', 'B', 100, 1, MboBookEngine.F_LAST));
+
+        assertThatThrownBy(() -> engine.apply(event(1, 201, 'A', 'A', 100, 1, MboBookEngine.F_LAST)))
+            .isInstanceOf(MboBookInvariantException.class);
+
+        assertThat(engine.snapshot(1, 750, 10).asks()).isEmpty();
+        assertThat(engine.snapshot(1, 750, 10).bids())
+            .containsExactly(new MboBookEngine.Level(100, 1, 1));
+    }
+
+    @Test
+    void rejectedMessageRollsBackAllOfItsHistoricalRecords() {
+        MboBookEngine engine = new MboBookEngine();
+        engine.apply(event(0, 101, 'A', 'B', 100, 1, MboBookEngine.F_LAST));
+
+        assertThat(engine.apply(event(1, 201, 'A', 'A', 100, 1, 0))).isEmpty();
+        assertThatThrownBy(() -> engine.apply(event(2, 0, 'N', 'N', 0, 0, MboBookEngine.F_LAST)))
+            .isInstanceOf(MboBookInvariantException.class)
+            .hasMessageContaining("crossed book");
+
+        assertThat(engine.snapshot(1, 750, 10).asks()).isEmpty();
+        assertThat(engine.snapshot(1, 750, 10).bids())
+            .containsExactly(new MboBookEngine.Level(100, 1, 1));
+        assertThat(engine.apply(event(3, 202, 'A', 'A', 101, 1, MboBookEngine.F_LAST)))
+            .get()
+            .extracting(MboBookEngine.BookSnapshot::crossed)
+            .isEqualTo(false);
+    }
+
+    @Test
     void rejectsDerivedRecordsAndNonMboRtypes() {
         assertThatThrownBy(() -> new MboEvent(0, 1, 1, 159, 1, 750, 'A', 'B', 100, 1, 0, 1, 0, 0, 1))
             .isInstanceOf(IllegalArgumentException.class)

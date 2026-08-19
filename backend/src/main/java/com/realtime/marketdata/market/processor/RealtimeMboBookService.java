@@ -8,8 +8,10 @@ import com.realtime.marketdata.orderbook.engine.MboBookEngine;
 import com.realtime.marketdata.orderbook.engine.MboBookEngineFactory;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.Duration;
 import java.util.Locale;
 import java.util.Optional;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.JsonNode;
 
@@ -24,6 +26,18 @@ import tools.jackson.databind.JsonNode;
 public final class RealtimeMboBookService {
     private static final int ATAS_PUBLISHER_ID = 0;
     private final MboStreamProcessor streams = new MboStreamProcessor(new MboBookEngineFactory());
+
+    /** Explicitly drops a source stream after disconnect or provider session rollover. */
+    public void closeStream(String streamId) {
+        if (streamId != null && !streamId.isBlank()) {
+            streams.close(new MboStreamKey("atas", streamId));
+        }
+    }
+
+    @Scheduled(fixedDelayString = "${app.atas.mbo-stream-eviction-ms:300000}")
+    void evictIdleStreams() {
+        streams.evictIdle(Duration.ofMinutes(30));
+    }
 
     /**
      * 应用一条完整 ATAS MBO 消息并返回重建后的盘口深度。非 MBO 消息、不支持的来源或字段
@@ -51,12 +65,21 @@ public final class RealtimeMboBookService {
         Long instrumentId = event.canonicalId();
         Long orderId = longValue(data, "exchange_order_id", "exchangeOrderId", "order_id", "orderId");
         Character side = side(event.side());
+        if (side == null) {
+            side = side(text(data, "side", "order_side", "orderSide"));
+        }
         Long priceNano = priceNano(event.price());
+        if (priceNano == null) {
+            priceNano = priceNano(decimal(data, "price", "px", "order_price", "orderPrice"));
+        }
 
+        boolean delete = action == LiveMboEvent.Action.DELETE;
         if (streamId == null || sourceSequence == null || instrumentId == null || action == null
-            || orderId == null || side == null || priceNano == null) {
+            || orderId == null || (!delete && (side == null || priceNano == null))) {
             return Optional.empty();
         }
+        if (side == null) side = 'N';
+        if (priceNano == null) priceNano = LiveMboEvent.MISSING_PRICE_NANO;
 
         long size = size(event.quantity(), action);
         if (size < 0) {
@@ -116,6 +139,16 @@ public final class RealtimeMboBookService {
             return result > 0 ? result : -1;
         } catch (ArithmeticException ignored) {
             return -1;
+        }
+    }
+
+    private BigDecimal decimal(JsonNode source, String... fields) {
+        JsonNode value = node(source, fields);
+        if (value == null) return null;
+        try {
+            return value.isNumber() ? value.decimalValue() : new BigDecimal(value.asString());
+        } catch (NumberFormatException ignored) {
+            return null;
         }
     }
 

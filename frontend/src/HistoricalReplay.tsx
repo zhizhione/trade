@@ -4,7 +4,14 @@ import { ReplayCandleChart } from './charts/ReplayCandleChart';
 import {
   loadReplayCatalog,
 } from './api/replay';
-import { nanoPrice, type ReplayCatalogEntry, type ReplaySession, type ReplayStreamConnection, type ReplayStreamMessage } from './domain/replay';
+import {
+  nanoPrice,
+  type ReplayCatalogEntry,
+  type ReplayFrame,
+  type ReplaySession,
+  type ReplayStreamConnection,
+  type ReplayStreamMessage,
+} from './domain/replay';
 import { connectReplayWebSocket } from './realtime/replaySocket';
 import {
   formatNewYorkDateTime,
@@ -13,6 +20,7 @@ import {
 } from './time';
 
 const SPEEDS = [1, 5, 20];
+const FRAME_WINDOW_SIZE = 1_000;
 
 function formatQuantity(value: number | undefined): string {
   return value === undefined ? '—' : value.toLocaleString();
@@ -55,6 +63,7 @@ export function HistoricalReplay() {
   const replayConnectionRef = useRef<ReplayStreamConnection | undefined>(undefined);
   const playingRef = useRef(false);
   const receivedFrameCountRef = useRef(0);
+  const frameStoreRef = useRef<Map<number, ReplayFrame>>(new Map());
 
   const appendBar = useCallback((bar: ReplaySession['bars'][number]) => {
     setSession((current) => {
@@ -84,6 +93,7 @@ export function HistoricalReplay() {
       setCursor(0);
       cursorRef.current = 0;
       receivedFrameCountRef.current = 0;
+      frameStoreRef.current.clear();
       setLoading(false);
       // 查询会创建服务端任务并立即开始播放，让用户无需再次点击即可看到首个历史盘口。
       playingRef.current = true;
@@ -97,10 +107,18 @@ export function HistoricalReplay() {
     if (message.type === 'replay_frame') {
       const nextIndex = receivedFrameCountRef.current;
       receivedFrameCountRef.current += 1;
+      frameStoreRef.current.set(nextIndex, message.payload);
+      const nextWindowStart = Math.max(0, nextIndex - FRAME_WINDOW_SIZE + 1);
+      const nextWindow: ReplayFrame[] = [];
+      for (let index = nextWindowStart; index <= nextIndex; index += 1) {
+        const stored = frameStoreRef.current.get(index);
+        if (stored) nextWindow.push(stored);
+      }
       setSession((current) => current ? {
         ...current,
-        frames: [...current.frames, message.payload],
+        frames: nextWindow,
       } : current);
+      setLoading(false);
       if (playingRef.current) {
         cursorRef.current = nextIndex;
         setCursor(nextIndex);
@@ -112,6 +130,13 @@ export function HistoricalReplay() {
       return;
     }
     if (message.type === 'replay_complete') {
+      if (message.payload.hasNext && message.payload.nextCursor) {
+        // 分段完成不是整次回放完成，继续使用同一个服务端订单簿任务。
+        replayConnectionRef.current?.send('replay_continue', {
+          cursor: message.payload.nextCursor,
+        });
+        return;
+      }
       playingRef.current = false;
       setPlaying(false);
       setLoading(false);
@@ -162,7 +187,7 @@ export function HistoricalReplay() {
       endMs: Math.max(range.endMs, entry.endMs),
     }), { startMs: matchingEntries[0].startMs, endMs: matchingEntries[0].endMs });
   }, [catalog, selected]);
-  const frame = session?.frames[cursor];
+  const frame = frameStoreRef.current.get(cursor);
   const queryStartMs = useMemo(() => parseNewYorkDateTimeInput(queryStartTime), [queryStartTime]);
   const queryEndMs = useMemo(() => parseNewYorkDateTimeInput(queryEndTime), [queryEndTime]);
   const queryRangeValid = Boolean(
@@ -204,6 +229,7 @@ export function HistoricalReplay() {
     setCursor(0);
     cursorRef.current = 0;
     receivedFrameCountRef.current = 0;
+    frameStoreRef.current.clear();
     setQueryStartTime(availableRange ? toNewYorkDateTimeInput(availableRange.startMs) : '');
     setQueryEndTime(availableRange ? toNewYorkDateTimeInput(availableRange.endMs) : '');
   }, [availableRange]);
@@ -232,6 +258,7 @@ export function HistoricalReplay() {
     setCursor(0);
     cursorRef.current = 0;
     receivedFrameCountRef.current = 0;
+    frameStoreRef.current.clear();
     replayConnectionRef.current?.send('replay_start', {
       publisherId: selected.publisherId,
       instrumentId: selected.instrumentId,
@@ -243,8 +270,21 @@ export function HistoricalReplay() {
     });
   }, [barIntervalMs, queryEndMs, queryStartMs, selected, speed]);
 
+  const refreshFrameWindow = useCallback((center: number) => {
+    const total = receivedFrameCountRef.current;
+    if (total === 0) return;
+    const start = Math.max(0, Math.min(center - Math.floor(FRAME_WINDOW_SIZE / 2), total - FRAME_WINDOW_SIZE));
+    const end = Math.min(total, start + FRAME_WINDOW_SIZE);
+    const nextWindow: ReplayFrame[] = [];
+    for (let index = start; index < end; index += 1) {
+      const stored = frameStoreRef.current.get(index);
+      if (stored) nextWindow.push(stored);
+    }
+    setSession((current) => current ? { ...current, frames: nextWindow } : current);
+  }, []);
+
   const seekFrame = useCallback((index: number, pause = false) => {
-    const maximum = Math.max(0, (session?.frames.length ?? 1) - 1);
+    const maximum = Math.max(0, receivedFrameCountRef.current - 1);
     const next = Math.min(Math.max(0, index), maximum);
     if (pause) {
       playingRef.current = false;
@@ -253,7 +293,8 @@ export function HistoricalReplay() {
     }
     cursorRef.current = next;
     setCursor(next);
-  }, [session]);
+    refreshFrameWindow(next);
+  }, [refreshFrameWindow]);
 
   const togglePlayback = useCallback(() => {
     if (!session || replayFinished) return;
@@ -269,16 +310,17 @@ export function HistoricalReplay() {
   }, [session]);
 
   const seekTime = useCallback((timeMs: number) => {
-    if (!session?.frames.length) return;
+    if (receivedFrameCountRef.current === 0) return;
     let low = 0;
-    let high = session.frames.length - 1;
+    let high = receivedFrameCountRef.current - 1;
     while (low < high) {
       const middle = Math.floor((low + high) / 2);
-      if (session.frames[middle].timeMs < timeMs) low = middle + 1;
+      const middleFrame = frameStoreRef.current.get(middle);
+      if (!middleFrame || middleFrame.timeMs < timeMs) low = middle + 1;
       else high = middle;
     }
     seekFrame(low, true);
-  }, [session, seekFrame]);
+  }, [seekFrame]);
 
   const imbalance = frame ? (() => {
     const bid = frame.bids.reduce((total, level) => total + level.size, 0);
@@ -317,7 +359,7 @@ export function HistoricalReplay() {
   const cancelRate = frame && frame.addedSize + frame.cancelledSize > 0
     ? frame.cancelledSize / (frame.addedSize + frame.cancelledSize) * 100
     : undefined;
-  const previousFrame = session?.frames[cursor - 1];
+  const previousFrame = cursor > 0 ? frameStoreRef.current.get(cursor - 1) : undefined;
   const priceRange = useMemo(() => {
     if (!frame) return undefined;
     const levels = [...frame.bids, ...frame.asks];
@@ -426,6 +468,16 @@ export function HistoricalReplay() {
       {error && <div className="replay-error-status" role="status">{error}</div>}
 
       <section className="replay-timeline">
+        <input
+          className="replay-timeline__range"
+          type="range"
+          min={0}
+          max={Math.max(0, receivedFrameCountRef.current - 1)}
+          value={Math.min(cursor, Math.max(0, receivedFrameCountRef.current - 1))}
+          disabled={receivedFrameCountRef.current === 0}
+          onChange={(event) => seekFrame(Number(event.target.value), true)}
+          aria-label="回放帧位置"
+        />
         <time>{frame ? formatNewYorkDateTime(frame.timeMs) : '等待数据'}</time>
       </section>
 
@@ -488,7 +540,7 @@ export function HistoricalReplay() {
       </section>
 
       <footer className="terminal-footer">
-        <span>回放位置 {session?.frames.length ? `${cursor + 1} / ${session.frames.length}` : '—'}</span>
+        <span>回放位置 {receivedFrameCountRef.current ? `${cursor + 1} / ${receivedFrameCountRef.current}` : '—'}</span>
         <span>数据源 {session?.fileSha256 === 'STREAM' ? '按时间范围流式回放' : '—'}</span>
         <span>{loading ? '加载中…' : replayTruncated ? '已到单次回放上限，请缩小时间范围' : '就绪'}</span>
       </footer>

@@ -4,6 +4,7 @@ import com.realtime.marketdata.mbo.model.LiveMboEvent;
 import com.realtime.marketdata.mbo.model.MboEvent;
 import com.realtime.marketdata.orderbook.engine.MboBookEngine;
 import com.realtime.marketdata.orderbook.engine.MboBookEngineFactory;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -18,6 +19,7 @@ import java.util.function.Supplier;
  */
 public final class MboStreamProcessor {
     private final ConcurrentMap<MboStreamKey, MboBookEngine> engines = new ConcurrentHashMap<>();
+    private final ConcurrentMap<MboStreamKey, Long> lastSeenNanos = new ConcurrentHashMap<>();
     private final Supplier<MboBookEngine> engineFactory;
 
     public MboStreamProcessor(boolean rejectCrossedBooks, int snapshotDepth) {
@@ -35,6 +37,7 @@ public final class MboStreamProcessor {
     public Optional<MboBookEngine.BookSnapshot> accept(MboStreamKey stream, MboEvent event) {
         MboBookEngine engine = engine(stream);
         synchronized (engine) {
+            lastSeenNanos.put(stream, System.nanoTime());
             return engine.apply(event);
         }
     }
@@ -42,6 +45,7 @@ public final class MboStreamProcessor {
     public Optional<MboBookEngine.BookSnapshot> accept(MboStreamKey stream, LiveMboEvent event) {
         MboBookEngine engine = engine(stream);
         synchronized (engine) {
+            lastSeenNanos.put(stream, System.nanoTime());
             return engine.apply(event);
         }
     }
@@ -77,6 +81,23 @@ public final class MboStreamProcessor {
      */
     public void close(MboStreamKey stream) {
         engines.remove(stream);
+        lastSeenNanos.remove(stream);
+    }
+
+    /** Evicts idle source streams so reconnects cannot retain unbounded L3 state. */
+    public void evictIdle(Duration idleFor) {
+        if (idleFor == null || idleFor.isNegative() || idleFor.isZero()) {
+            throw new IllegalArgumentException("idleFor must be positive");
+        }
+        long cutoff = System.nanoTime() - idleFor.toNanos();
+        engines.forEach((stream, engine) -> {
+            synchronized (engine) {
+                Long seen = lastSeenNanos.get(stream);
+                if (seen != null && seen < cutoff && engines.remove(stream, engine)) {
+                    lastSeenNanos.remove(stream, seen);
+                }
+            }
+        });
     }
 
     private MboBookEngine engine(MboStreamKey stream) {

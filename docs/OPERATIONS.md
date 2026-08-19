@@ -31,7 +31,7 @@ cd frontend && npm run build
    `committed_rows` 一致。
 3. 打开回放页面前，确认 `databento_mbo_file_catalog FINAL` 包含该文件。
 4. 确认选中的 `(publisher_id, instrument_id)` 存在于原始数据中。
-5. 如果流报告达到 6,000 帧限制，请缩小时间范围。
+5. 单段达到 20,000 帧时页面会自动请求下一段；只有游标失效或数据库异常时才需要缩小时间范围并检查日志。
 
 ## Schema 规则
 

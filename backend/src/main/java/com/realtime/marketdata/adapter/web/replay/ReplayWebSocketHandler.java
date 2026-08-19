@@ -1,6 +1,7 @@
 package com.realtime.marketdata.adapter.web.replay;
 
 import com.realtime.marketdata.replay.engine.MboReplayStreamService;
+import com.realtime.marketdata.replay.model.ReplayCursor;
 import com.realtime.marketdata.replay.model.ReplayStreamRequest;
 import java.io.EOFException;
 import java.io.IOException;
@@ -57,7 +58,7 @@ public final class ReplayWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     /**
-     * 解析 replay_start、replay_play、replay_pause、replay_speed 与 replay_stop 命令，
+     * 解析 replay_start、replay_continue、replay_play、replay_pause、replay_speed 与 replay_stop 命令，
      * 所有响应统一封装为 {type, payload}，使前端可按消息类型处理。
      */
     protected void handleTextMessage(WebSocketSession session, TextMessage message) {
@@ -83,6 +84,11 @@ public final class ReplayWebSocketHandler extends TextWebSocketHandler {
                 case "replay_play" -> {
                     log.info("Replay play requested: connectionId={}", session.getId());
                     control(session, "play", replay.play(session.getId()));
+                }
+                case "replay_continue" -> {
+                    ReplayCursor cursor = cursor(payload);
+                    log.info("Replay continuation requested: connectionId={}, cursor={}", session.getId(), cursor);
+                    control(session, "continue", replay.continueReplay(session.getId(), cursor));
                 }
                 case "replay_pause" -> {
                     log.info("Replay pause requested: connectionId={}", session.getId());
@@ -122,6 +128,17 @@ public final class ReplayWebSocketHandler extends TextWebSocketHandler {
         JsonNode value = node == null ? null : node.get(field);
         if (value == null || value.isNull()) throw new IllegalArgumentException("缺少回放参数: " + field);
         return value.asLong();
+    }
+
+    private ReplayCursor cursor(JsonNode payload) {
+        if (payload == null) throw new IllegalArgumentException("回放游标不能为空");
+        JsonNode value = payload.get("cursor");
+        if (value == null || value.isNull()) throw new IllegalArgumentException("缺少回放参数: cursor");
+        return new ReplayCursor(
+            text(value, "fileSha256"),
+            text(value, "sourceOrdinal"),
+            text(value, "lastEventNs")
+        );
     }
 
     private long optionalNumber(JsonNode node, String field, long fallback) {

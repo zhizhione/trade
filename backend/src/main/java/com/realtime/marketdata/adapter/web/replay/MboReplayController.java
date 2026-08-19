@@ -55,7 +55,7 @@ public class MboReplayController {
         @RequestParam(defaultValue = "100") int bucketMs,
         @RequestParam long startMs,
         @RequestParam long endMs,
-        @RequestParam(defaultValue = "6000") int limit,
+        @RequestParam(defaultValue = "20000") int limit,
         @RequestParam(defaultValue = "1000") int barIntervalMs,
         @RequestParam(defaultValue = "false") boolean diagnostic
     ) {

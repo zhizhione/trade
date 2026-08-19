@@ -44,7 +44,7 @@ DBN 文件 -> Python 导入器 -> ClickHouse 原始事实数据
    然后仅输出请求时间窗口内的事件。
 6. `complete=false` 和 `crossed=true` 帧仅用于诊断，策略代码必须
    排除它们。
-7. 单个流最多发送 6,000 个可见帧。如需更长的回放，请查询更小的时间范围。
+7. 单个流分段最多发送 20,000 个可见帧；分段游标由文件哈希、文件内 source ordinal 和上一事件时间组成，客户端通过 `replay_continue` 续播，订单簿状态在服务端任务内保持。
 
 回放目录在 API 边界以 `(file_sha256, publisher_id, instrument_id)` 为键。每个文件中的
 全部原始 Databento 身份都会出现在目录中，回放状态机始终按这组身份隔离订单簿。

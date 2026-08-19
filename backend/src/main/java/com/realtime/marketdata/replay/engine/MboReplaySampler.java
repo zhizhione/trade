@@ -6,12 +6,13 @@ import com.realtime.marketdata.orderbook.engine.MboBookEngineFactory;
 import com.realtime.marketdata.orderbook.engine.MboBookInvariantException;
 import com.realtime.marketdata.replay.model.ReplayFrame;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * 在每个事件时间采样桶内保留最后一个 F_LAST 后的完整订单簿状态。
@@ -24,8 +25,9 @@ public final class MboReplaySampler {
     private final long bucketNs;
     private final long windowStartMs;
     private final MboBookEngine engine;
-    private final Map<MboBookEngine.BookKey, Pending> pending = new HashMap<>();
-    private final Map<MboBookEngine.BookKey, BucketFlow> flows = new HashMap<>();
+    private final Map<MboBookEngine.BookKey, NavigableMap<Long, Pending>> pending = new HashMap<>();
+    private final Map<MboBookEngine.BookKey, Map<Long, BucketFlow>> flows = new HashMap<>();
+    private final Map<MboBookEngine.BookKey, Long> latestObservedBuckets = new HashMap<>();
     private final Set<MboBookEngine.BookKey> initializedBooks = new HashSet<>();
 
     /** 按回放策略创建采样器；默认使用历史深度和允许保留交叉盘的策略。 */
@@ -67,7 +69,7 @@ public final class MboReplaySampler {
     /** 接收一条 MBO 事件，并输出因进入新时间桶而已经确定的旧桶帧。 */
     public List<ReplayFrame> accept(MboEvent event) {
         MboBookEngine.BookKey key = new MboBookEngine.BookKey(event.publisherId(), event.instrumentId());
-        long bucketStartNs = bucketStart(event.tsEventNs());
+        long bucketStartNs = effectiveBucket(key, bucketStart(event.tsEventNs()));
         BucketFlow flow = flowFor(key, bucketStartNs);
         flow.record(event, isInDisplayWindow(event));
         if (event.action() == 'R') {
@@ -78,30 +80,39 @@ public final class MboReplaySampler {
             return List.of();
         }
         MboBookEngine.BookSnapshot snapshot = result.get();
-        Pending previous = pending.get(key);
-        if (previous != null && currentTimeMs(bucketStartNs) < previous.frame.timeMs()) {
-            throw new MboBookInvariantException("F_LAST event timestamp regressed within book");
-        }
         ReplayFrame current = frame(
             bucketStartNs, snapshot, initializedBooks.contains(key),
             flow.addedSize, flow.cancelledSize, flow.tradedSize
         );
-        pending.put(key, new Pending(current));
-        return previous != null && previous.frame.timeMs() < current.timeMs()
-            ? List.of(previous.frame)
-            : List.of();
+        NavigableMap<Long, Pending> bookPending = pending.computeIfAbsent(key, ignored -> new TreeMap<>());
+        Pending previous = bookPending.put(bucketStartNs, new Pending(current));
+        // Event time is an observation clock, not the authoritative stream order. effectiveBucket()
+        // prevents a late timestamp from recreating a bucket that has already been emitted.
+        if (previous != null || bookPending.size() < 2) {
+            return List.of();
+        }
+        Long earlier = bookPending.firstKey();
+        if (earlier.equals(bucketStartNs)) {
+            return List.of();
+        }
+        Pending ready = bookPending.remove(earlier);
+        removeFlow(key, earlier);
+        return List.of(ready.frame);
     }
 
     /** 按源顺序号输出所有订单簿最后尚未结束的部分时间桶。 */
     /** 输入流结束时刷新每个订单簿的最后一个未完成时间桶。 */
     public List<ReplayFrame> finish() {
         List<ReplayFrame> result = new ArrayList<>();
-        for (Pending value : pending.values()) {
-            result.add(value.frame);
+        for (NavigableMap<Long, Pending> bookPending : pending.values()) {
+            for (Pending value : bookPending.values()) {
+                result.add(value.frame);
+            }
         }
-        result.sort(Comparator.comparingLong(ReplayFrame::sourceOrdinal));
+        result.sort((left, right) -> Long.compareUnsigned(left.sourceOrdinal(), right.sourceOrdinal()));
         pending.clear();
         flows.clear();
+        latestObservedBuckets.clear();
         return List.copyOf(result);
     }
 
@@ -113,16 +124,30 @@ public final class MboReplaySampler {
     }
 
     private BucketFlow flowFor(MboBookEngine.BookKey key, long bucketStartNs) {
-        BucketFlow current = flows.get(key);
-        if (current == null || current.bucketStartNs < bucketStartNs) {
-            BucketFlow next = new BucketFlow(bucketStartNs);
-            flows.put(key, next);
-            return next;
+        Map<Long, BucketFlow> bookFlows = flows.computeIfAbsent(key, ignored -> new HashMap<>());
+        return bookFlows.computeIfAbsent(bucketStartNs, BucketFlow::new);
+    }
+
+    private long effectiveBucket(MboBookEngine.BookKey key, long eventBucketStartNs) {
+        Long latest = latestObservedBuckets.get(key);
+        if (latest == null || eventBucketStartNs > latest) {
+            latestObservedBuckets.put(key, eventBucketStartNs);
+            return eventBucketStartNs;
         }
-        if (current.bucketStartNs > bucketStartNs) {
-            throw new MboBookInvariantException("event timestamp regressed within book flow bucket");
+        // Source ordinal defines the L3 state sequence. A late event-time value therefore belongs
+        // to the current source-ordered bucket instead of recreating an already emitted time bucket.
+        return latest;
+    }
+
+    private void removeFlow(MboBookEngine.BookKey key, long bucketStartNs) {
+        Map<Long, BucketFlow> bookFlows = flows.get(key);
+        if (bookFlows == null) {
+            return;
         }
-        return current;
+        bookFlows.remove(bucketStartNs);
+        if (bookFlows.isEmpty()) {
+            flows.remove(key);
+        }
     }
 
     private ReplayFrame frame(

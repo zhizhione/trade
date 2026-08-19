@@ -2,6 +2,7 @@ package com.realtime.marketdata.replay.source;
 
 import com.realtime.marketdata.mbo.model.MboEvent;
 import com.realtime.marketdata.replay.model.ReplayCatalogEntry;
+import com.realtime.marketdata.replay.model.ReplayCursor;
 import java.util.List;
 
 /**
@@ -26,6 +27,24 @@ public interface MboReplayEventSource {
         MboEventConsumer consumer
     );
 
+    /** 从指定原始位置继续读取；首次读取时 cursor 传 null。 */
+    default StreamResult streamEvents(
+        int publisherId,
+        long instrumentId,
+        long startMs,
+        long endMs,
+        ReplayCursor cursor,
+        MboEventConsumer consumer
+    ) {
+        if (cursor != null) {
+            throw new UnsupportedOperationException("replay source does not support cursor continuation");
+        }
+        return new StreamResult(
+            streamEvents(publisherId, instrumentId, startMs, endMs, consumer),
+            null
+        );
+    }
+
     /** 根据来源身份返回展示用合约代码；找不到时由实现决定是否返回回退名称。 */
     String symbol(int publisherId, long instrumentId);
 
@@ -33,5 +52,8 @@ public interface MboReplayEventSource {
     interface MboEventConsumer {
         /** 消费一条已按源顺序读取的 MBO 事件，返回 false 表示停止读取。 */
         boolean accept(MboEvent event);
+    }
+
+    record StreamResult(boolean completed, ReplayCursor nextCursor) {
     }
 }

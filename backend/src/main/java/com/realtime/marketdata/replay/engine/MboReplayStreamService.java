@@ -3,6 +3,7 @@ package com.realtime.marketdata.replay.engine;
 import com.realtime.marketdata.mbo.model.MboEvent;
 import com.realtime.marketdata.orderbook.engine.MboBookEngineFactory;
 import com.realtime.marketdata.replay.model.ReplayBar;
+import com.realtime.marketdata.replay.model.ReplayCursor;
 import com.realtime.marketdata.replay.model.ReplayFrame;
 import com.realtime.marketdata.replay.model.ReplayStreamRequest;
 import com.realtime.marketdata.replay.source.MboReplayEventSource;
@@ -31,9 +32,12 @@ import org.springframework.stereotype.Service;
  */
 @Service
 public final class MboReplayStreamService {
-    private static final int MAX_STREAM_FRAMES = 6_000;
+    static final int MAX_STREAM_FRAMES = 20_000;
     private static final MboBookEngineFactory ENGINE_FACTORY = new MboBookEngineFactory();
     private static final Logger log = LoggerFactory.getLogger(MboReplayStreamService.class);
+    /** A locally buffered tail has no raw-source cursor, but still uses the existing continuation protocol. */
+    private static final String FINALIZED_TAIL_CURSOR_SHA =
+        "0000000000000000000000000000000000000000000000000000000000000000";
     /** 夜盘休市或周末的长时间空档不能阻塞交互式回放，因此会被压缩。 */
     private static final long MAX_INTERACTIVE_GAP_MS = 1_000L;
 
@@ -80,6 +84,12 @@ public final class MboReplayStreamService {
         return job != null && job.play();
     }
 
+    /** 请求当前分段之后的下一段；游标必须来自上一条 replay_complete 消息。 */
+    public boolean continueReplay(String connectionId, ReplayCursor cursor) {
+        ReplayJob job = jobs.get(connectionId);
+        return job != null && job.continueFrom(cursor);
+    }
+
     /** 暂停指定连接的事件推进，但保留当前订单簿和回放游标。 */
     public boolean pause(String connectionId) {
         ReplayJob job = jobs.get(connectionId);
@@ -122,7 +132,14 @@ public final class MboReplayStreamService {
         private volatile boolean stopped;
         private boolean playing;
         private double speed;
-        private int emittedFrames;
+        private final MboReplaySampler sampler;
+        private final MutableBar bar;
+        private long previousFrameMs = -1L;
+        private long totalEmittedFrames;
+        private boolean continueRequested;
+        private ReplayCursor requestedCursor;
+        private List<ReplayFrame> finalizedTail = List.of();
+        private int finalizedTailIndex;
 
         private ReplayJob(
             String connectionId,
@@ -133,12 +150,16 @@ public final class MboReplayStreamService {
             this.request = request;
             this.sink = sink;
             this.speed = request.speed();
+            this.sampler = new MboReplaySampler(
+                request.bucketMs(), ENGINE_FACTORY.create(false, request.depth()), request.startMs()
+            );
+            this.bar = new MutableBar(request.barIntervalMs());
         }
 
         @Override
         public void run() {
             try {
-                stream();
+                streamChunks();
             } catch (Exception exception) {
                 if (!stopped) {
                     log.error("MBO replay stream failed for connection {}", connectionId, exception);
@@ -149,67 +170,138 @@ public final class MboReplayStreamService {
             }
         }
 
-        private void stream() {
+        private void streamChunks() {
+            ReplayCursor cursor = null;
+            while (!stopped) {
+                ChunkResult chunk = readChunk(cursor);
+                if (chunk == null) return;
+                playBuffered(chunk.buffered());
+                if (chunk.nextCursor() == null) return;
+                cursor = awaitContinuation(chunk.nextCursor());
+                if (cursor == null) return;
+            }
+        }
+
+        private ChunkResult readChunk(ReplayCursor cursor) {
+            if (isFinalizedTailCursor(cursor)) {
+                return readFinalizedTailChunk();
+            }
             long readStartedNanos = System.nanoTime();
-            log.info(
-                "Replay source read started: connectionId={}, publisherId={}, instrumentId={}, startMs={}, endMs={}",
-                connectionId, request.publisherId(), request.instrumentId(), request.startMs(), request.endMs()
-            );
-            MboReplaySampler sampler = new MboReplaySampler(
-                request.bucketMs(), ENGINE_FACTORY.create(false, request.depth()), request.startMs()
-            );
-            MutableBar bar = new MutableBar(request.barIntervalMs());
-            long[] previousFrameMs = {-1L};
+            int[] chunkFrames = {0};
             boolean[] truncated = {false};
             List<BufferedMessage> buffered = new ArrayList<>();
-
-            boolean completed = source.streamEvents(
+            log.info(
+                "Replay source chunk started: connectionId={}, cursor={}, totalFrames={}",
+                connectionId, cursor, totalEmittedFrames
+            );
+            MboReplayEventSource.StreamResult result = source.streamEvents(
                 request.publisherId(),
                 request.instrumentId(),
                 request.startMs(),
                 request.endMs(),
-                event -> accept(
-                    event, sampler, bar, previousFrameMs, truncated, buffered
-                )
+                cursor,
+                event -> accept(event, chunkFrames, truncated, buffered)
             );
-            long readElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - readStartedNanos);
-            if (stopped) {
-                log.info(
-                    "Replay source read stopped: connectionId={}, frames={}, elapsedMs={}",
-                    connectionId, emittedFrames, readElapsedMs
-                );
-                return;
+            if (stopped) return null;
+            if (!result.completed() && result.nextCursor() == null) {
+                log.warn("Replay source ended without a continuation cursor: connectionId={}", connectionId);
+                return null;
             }
-            if (!completed && !truncated[0]) {
-                log.warn(
-                    "Replay source ended before completion: connectionId={}, frames={}, elapsedMs={}",
-                    connectionId, emittedFrames, readElapsedMs
-                );
-                return;
+            if (result.completed()) {
+                bufferFinalizedFrames(sampler.finish(), chunkFrames, truncated, buffered);
+                if (!truncated[0]) bufferBar(buffered, bar.closeCompleted());
             }
-            if (completed && !truncated[0]) {
-                bufferFrames(sampler.finish(), bar, previousFrameMs, truncated, buffered);
-                if (!truncated[0]) {
-                    bufferBar(buffered, bar.closeCompleted());
+            ReplayCursor nextCursor = result.completed() && hasFinalizedTail()
+                ? finalizedTailCursor()
+                : result.completed() ? null : result.nextCursor();
+            buffered.add(new BufferedMessage("replay_complete", Map.of(
+                "startMs", request.startMs(),
+                "endMs", request.endMs(),
+                "truncated", truncated[0],
+                "hasNext", nextCursor != null,
+                "nextCursor", nextCursor == null ? Map.of() : nextCursor
+            ), 0L));
+            log.info(
+                "Replay source chunk ready: connectionId={}, chunkFrames={}, messages={}, hasNext={}, elapsedMs={}",
+                connectionId, chunkFrames[0], buffered.size(), nextCursor != null,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - readStartedNanos)
+            );
+            return new ChunkResult(buffered, nextCursor);
+        }
+
+        private ChunkResult readFinalizedTailChunk() {
+            int[] chunkFrames = {0};
+            boolean[] truncated = {false};
+            List<BufferedMessage> buffered = new ArrayList<>();
+            while (finalizedTailIndex < finalizedTail.size()) {
+                boolean accepted = bufferFrames(
+                    List.of(finalizedTail.get(finalizedTailIndex)), chunkFrames, truncated, buffered
+                );
+                finalizedTailIndex += 1;
+                if (!accepted) {
+                    if (!truncated[0]) {
+                        finalizedTailIndex = finalizedTail.size();
+                    }
+                    break;
                 }
+            }
+            ReplayCursor nextCursor = hasFinalizedTail() ? finalizedTailCursor() : null;
+            if (nextCursor == null) {
+                finalizedTail = List.of();
+                finalizedTailIndex = 0;
+                bufferBar(buffered, bar.closeCompleted());
             }
             buffered.add(new BufferedMessage("replay_complete", Map.of(
                 "startMs", request.startMs(),
                 "endMs", request.endMs(),
-                "truncated", truncated[0]
+                "truncated", truncated[0],
+                "hasNext", nextCursor != null,
+                "nextCursor", nextCursor == null ? Map.of() : nextCursor
             ), 0L));
-            log.info(
-                "Replay source read complete: connectionId={}, frames={}, messages={}, completed={}, truncated={}, elapsedMs={}",
-                connectionId, emittedFrames, buffered.size(), completed, truncated[0], readElapsedMs
+            return new ChunkResult(buffered, nextCursor);
+        }
+
+        private void bufferFinalizedFrames(
+            List<ReplayFrame> frames,
+            int[] chunkFrames,
+            boolean[] truncated,
+            List<BufferedMessage> buffered
+        ) {
+            finalizedTail = List.copyOf(frames);
+            finalizedTailIndex = 0;
+            while (finalizedTailIndex < finalizedTail.size()) {
+                boolean accepted = bufferFrames(
+                    List.of(finalizedTail.get(finalizedTailIndex)), chunkFrames, truncated, buffered
+                );
+                finalizedTailIndex += 1;
+                if (!accepted) {
+                    if (!truncated[0]) {
+                        finalizedTailIndex = finalizedTail.size();
+                    }
+                    break;
+                }
+            }
+        }
+
+        private boolean hasFinalizedTail() {
+            return finalizedTailIndex < finalizedTail.size();
+        }
+
+        private ReplayCursor finalizedTailCursor() {
+            return new ReplayCursor(
+                FINALIZED_TAIL_CURSOR_SHA,
+                Integer.toString(finalizedTailIndex),
+                Integer.toString(finalizedTail.size())
             );
-            playBuffered(buffered);
+        }
+
+        private boolean isFinalizedTailCursor(ReplayCursor cursor) {
+            return cursor != null && cursor.equals(finalizedTailCursor());
         }
 
         private boolean accept(
             MboEvent event,
-            MboReplaySampler sampler,
-            MutableBar bar,
-            long[] previousFrameMs,
+            int[] chunkFrames,
             boolean[] truncated,
             List<BufferedMessage> buffered
         ) {
@@ -219,7 +311,7 @@ public final class MboReplayStreamService {
             long timeMs = event.tsEventNs() / 1_000_000L;
             boolean withinRequestedEnd = timeMs <= request.endMs();
             if (!bufferFrames(
-                sampler.accept(event), bar, previousFrameMs, truncated, buffered
+                sampler.accept(event), chunkFrames, truncated, buffered
             )) {
                 return false;
             }
@@ -228,8 +320,7 @@ public final class MboReplayStreamService {
 
         private boolean bufferFrames(
             List<ReplayFrame> frames,
-            MutableBar bar,
-            long[] previousFrameMs,
+            int[] chunkFrames,
             boolean[] truncated,
             List<BufferedMessage> buffered
         ) {
@@ -243,17 +334,18 @@ public final class MboReplayStreamService {
                 if (frame.timeMs() > request.endMs()) {
                     return false;
                 }
-                long previous = previousFrameMs[0];
+                long previous = previousFrameMs;
                 long delayMs = previous < 0
                     ? 0L
                     : Math.min(Math.max(0L, frame.timeMs() - previous), MAX_INTERACTIVE_GAP_MS);
                 buffered.add(new BufferedMessage("replay_frame", frame, delayMs));
-                emittedFrames += 1;
-                previousFrameMs[0] = frame.timeMs();
+                totalEmittedFrames += 1;
+                chunkFrames[0] += 1;
+                previousFrameMs = frame.timeMs();
                 ReplayBar completedBar = bar.observe(frame);
                 bufferBar(buffered, completedBar);
                 bufferBar(buffered, bar.current());
-                if (emittedFrames >= MAX_STREAM_FRAMES) {
+                if (chunkFrames[0] >= MAX_STREAM_FRAMES) {
                     // 限制浏览器端累积的帧数量，避免过大回放耗尽前端内存；用户可缩小时间窗口继续查询。
                     truncated[0] = true;
                     return false;
@@ -273,21 +365,21 @@ public final class MboReplayStreamService {
                 if (!awaitPlaying()) {
                     log.info(
                         "Replay playback stopped before send: connectionId={}, messagesSent={}, frames={}",
-                        connectionId, sentMessages, emittedFrames
+                        connectionId, sentMessages, totalEmittedFrames
                     );
                     return;
                 }
                 if (message.delayMs() > 0 && !awaitDelay(message.delayMs())) {
                     log.info(
                         "Replay playback stopped during delay: connectionId={}, messagesSent={}, frames={}",
-                        connectionId, sentMessages, emittedFrames
+                        connectionId, sentMessages, totalEmittedFrames
                     );
                     return;
                 }
                 if (!awaitPlaying()) {
                     log.info(
                         "Replay playback stopped before message: connectionId={}, messagesSent={}, frames={}",
-                        connectionId, sentMessages, emittedFrames
+                        connectionId, sentMessages, totalEmittedFrames
                     );
                     return;
                 }
@@ -295,8 +387,8 @@ public final class MboReplayStreamService {
                 sentMessages += 1;
             }
             log.info(
-                "Replay playback complete: connectionId={}, messagesSent={}, frames={}, elapsedMs={}",
-                connectionId, sentMessages, emittedFrames,
+                "Replay chunk playback complete: connectionId={}, messagesSent={}, frames={}, elapsedMs={}",
+                connectionId, sentMessages, totalEmittedFrames,
                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - playbackStartedNanos)
             );
         }
@@ -350,6 +442,25 @@ public final class MboReplayStreamService {
             return !stopped;
         }
 
+        private ReplayCursor awaitContinuation(ReplayCursor expected) {
+            controlLock.lock();
+            try {
+                while (!continueRequested && !stopped) {
+                    controlChanged.await();
+                }
+                if (stopped) return null;
+                ReplayCursor requested = requestedCursor;
+                continueRequested = false;
+                requestedCursor = null;
+                return expected.equals(requested) ? requested : null;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return null;
+            } finally {
+                controlLock.unlock();
+            }
+        }
+
         private boolean play() {
             controlLock.lock();
             try {
@@ -367,6 +478,20 @@ public final class MboReplayStreamService {
             try {
                 if (stopped) return false;
                 playing = false;
+                controlChanged.signalAll();
+                return true;
+            } finally {
+                controlLock.unlock();
+            }
+        }
+
+        private boolean continueFrom(ReplayCursor cursor) {
+            if (cursor == null) return false;
+            controlLock.lock();
+            try {
+                if (stopped) return false;
+                requestedCursor = cursor;
+                continueRequested = true;
                 controlChanged.signalAll();
                 return true;
             } finally {
@@ -406,6 +531,9 @@ public final class MboReplayStreamService {
         private String message(Exception exception) {
             String message = exception.getMessage();
             return message == null || message.isBlank() ? exception.getClass().getSimpleName() : message;
+        }
+
+        private record ChunkResult(List<BufferedMessage> buffered, ReplayCursor nextCursor) {
         }
 
         private record BufferedMessage(String type, Object payload, long delayMs) {

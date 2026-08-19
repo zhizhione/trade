@@ -7,10 +7,13 @@ import com.realtime.marketdata.orderbook.engine.MboBookEngine;
 import com.realtime.marketdata.replay.model.ReplayBar;
 import com.realtime.marketdata.replay.model.ReplayCatalogEntry;
 import com.realtime.marketdata.replay.model.ReplayFrame;
+import com.realtime.marketdata.replay.model.ReplayCursor;
 import com.realtime.marketdata.replay.model.ReplayStreamRequest;
 import com.realtime.marketdata.replay.source.MboReplayEventSource;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
@@ -171,6 +174,43 @@ class MboReplayStreamServiceTest {
         });
     }
 
+    @Test
+    void continuesLocallyBufferedFinalFramesInsteadOfDroppingTheTail() throws Exception {
+        List<MboEvent> events = new ArrayList<>(MboReplayStreamService.MAX_STREAM_FRAMES + 1);
+        for (int index = 0; index <= MboReplayStreamService.MAX_STREAM_FRAMES; index++) {
+            events.add(eventForInstrument(index, 0, 750L + index, 0, 'R', 'N', 0, 0));
+        }
+        service = new MboReplayStreamService(new InMemorySource(events));
+        List<ReplayFrame> frames = Collections.synchronizedList(new ArrayList<>());
+        List<ReplayCursor> cursors = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch firstChunk = new CountDownLatch(1);
+        CountDownLatch complete = new CountDownLatch(1);
+
+        service.start("socket-final-tail", new ReplayStreamRequest(1, 750, 100, 0, 0, 100, 1_000),
+            (type, payload) -> {
+                if ("replay_frame".equals(type)) frames.add((ReplayFrame) payload);
+                if ("replay_complete".equals(type)) {
+                    Map<?, ?> message = (Map<?, ?>) payload;
+                    if (Boolean.TRUE.equals(message.get("hasNext"))) {
+                        cursors.add((ReplayCursor) message.get("nextCursor"));
+                        firstChunk.countDown();
+                    } else {
+                        complete.countDown();
+                    }
+                }
+            }
+        );
+
+        assertThat(service.play("socket-final-tail")).isTrue();
+        assertThat(firstChunk.await(3, TimeUnit.SECONDS)).isTrue();
+        assertThat(frames).hasSize(MboReplayStreamService.MAX_STREAM_FRAMES);
+        assertThat(cursors).singleElement().satisfies(cursor ->
+            assertThat(service.continueReplay("socket-final-tail", cursor)).isTrue()
+        );
+        assertThat(complete.await(3, TimeUnit.SECONDS)).isTrue();
+        assertThat(frames).hasSize(MboReplayStreamService.MAX_STREAM_FRAMES + 1);
+    }
+
     private MboEvent event(
         long ordinal,
         long tsEventNs,
@@ -180,8 +220,21 @@ class MboReplayStreamServiceTest {
         long price,
         long size
     ) {
+        return eventForInstrument(ordinal, tsEventNs, 750, orderId, action, side, price, size);
+    }
+
+    private MboEvent eventForInstrument(
+        long ordinal,
+        long tsEventNs,
+        long instrumentId,
+        long orderId,
+        char action,
+        char side,
+        long price,
+        long size
+    ) {
         return new MboEvent(
-            ordinal, tsEventNs + 1, tsEventNs, 160, 1, 750, action, side,
+            ordinal, tsEventNs + 1, tsEventNs, 160, 1, instrumentId, action, side,
             price, size, 0, orderId, MboBookEngine.F_LAST, 0, ordinal
         );
     }
