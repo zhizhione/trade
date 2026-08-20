@@ -9,10 +9,13 @@ import org.junit.jupiter.api.Test;
 class MboBookEngineTest {
 
     @Test
-    void emitsAnAggregatedSnapshotOnlyAtLastRecordBoundary() {
+    void emitsASnapshotAfterEveryHistoricalRecord() {
         MboBookEngine engine = new MboBookEngine();
 
-        assertThat(engine.apply(event(0, 1, 'A', 'B', 20_000_000_000_000L, 4, 0))).isEmpty();
+        assertThat(engine.apply(event(0, 1, 'A', 'B', 20_000_000_000_000L, 4, 0)))
+            .get()
+            .extracting(snapshot -> snapshot.bids())
+            .isEqualTo(java.util.List.of(new MboBookEngine.Level(20_000_000_000_000L, 4, 1)));
         assertThat(engine.apply(event(1, 2, 'A', 'B', 20_000_000_000_000L, 6, MboBookEngine.F_LAST)))
             .get()
             .satisfies(snapshot -> {
@@ -117,11 +120,14 @@ class MboBookEngineTest {
     }
 
     @Test
-    void historicalMessageStateIsAppliedAsRecordsArrive() {
+    void historicalEventsProduceSnapshotsBeforeAndAtMessageEnd() {
         MboBookEngine engine = new MboBookEngine();
         engine.apply(event(0, 101, 'A', 'B', 100, 1, MboBookEngine.F_LAST));
 
-        assertThat(engine.apply(event(1, 201, 'A', 'A', 100, 1, 0))).isEmpty();
+        assertThat(engine.apply(event(1, 201, 'A', 'A', 100, 1, 0)))
+            .get()
+            .extracting(MboBookEngine.BookSnapshot::crossed)
+            .isEqualTo(true);
         assertThat(engine.apply(event(2, 0, 'N', 'N', 0, 0, MboBookEngine.F_LAST))).isPresent();
         assertThat(engine.snapshot(1, 750, 10).asks())
             .containsExactly(new MboBookEngine.Level(100, 1, 1));

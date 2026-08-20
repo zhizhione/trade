@@ -136,6 +136,29 @@ class MarketEventServiceTest {
     }
 
     @Test
+    void retainsIncompleteAtasMboWithoutUsingItsAggregateDepthPayload() throws Exception {
+        MarketStorageRepository storage = mock(MarketStorageRepository.class);
+        MarketWebSocketHandler socket = mock(MarketWebSocketHandler.class);
+        MarketEventService service = new MarketEventService(
+            JsonMapper.builder().findAndAddModules().build(),
+            storage,
+            socket,
+            new RealtimeMboBookService(),
+            "America/Chicago"
+        );
+
+        service.process("market.mbo", """
+            {"source":"atas","type":"New","symbol":"NQU6",
+             "bids":[[23456.25,10]],"asks":[[23456.50,8]]}
+            """);
+
+        ArgumentCaptor<MarketSnapshot> snapshots = ArgumentCaptor.forClass(MarketSnapshot.class);
+        verify(socket).broadcastSnapshot(snapshots.capture());
+        assertThat(snapshots.getValue().bids()).isEmpty();
+        assertThat(snapshots.getValue().asks()).isEmpty();
+    }
+
+    @Test
     void rebuildsLiveAtasDepthFromOrderLevelUpdates() throws Exception {
         MarketStorageRepository storage = mock(MarketStorageRepository.class);
         MarketWebSocketHandler socket = mock(MarketWebSocketHandler.class);

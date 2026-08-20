@@ -5,7 +5,7 @@
 - 实时链路：Kafka 事件经 Spring Boot 标准化、持久化，并通过 WebSocket 推送到 React 看板。
 - 历史链路：Python 无损导入 DBN，Java 回放服务按请求从 raw MBO 流式读取并逐事件重建 L3 订单簿，React 使用 Lightweight Charts 展示 K 线、DOM 最多 400 档和特征。
 
-当前已经完成历史 MBO 的有序唯一存储、单文件订单簿重建和可视化回放。`feature_extractor.py`
+当前已经完成历史 MBO 的有序唯一存储、跨文件订单簿重建和可视化回放。`feature_extractor.py`
 仍是 CSV 滚动特征原型；包含排队成交、手续费、滑点和资金曲线的完整策略回测引擎尚未实现。
 
 ## 系统架构
@@ -48,7 +48,7 @@ WebSocket 深度快照 /ws/market ──> React 实时看板
 
 ```text
 backend/    Java 21 / Spring Boot / MBO 状态机 / 回放 API
-frontend/   React / TypeScript / Vite / ECharts
+frontend/   React / TypeScript / Vite / ECharts / Lightweight Charts
 python/     DBN 导入、JSONL 导出、Kafka 离线消费和特征原型
 db/         ClickHouse、MySQL schema 和可选 NQ 合约种子
 docs/       架构、运维和故障排查说明
@@ -74,6 +74,10 @@ compose.yml ClickHouse 与 MySQL 本地环境
 - Node.js 20+
 - Python 3.11+
 - Kafka，仅实时链路需要；历史 DBN 导入和回放不需要 Kafka
+
+Compose 只提供 ClickHouse 和 MySQL，不会启动 Kafka。实时链路需要另行提供 Kafka，并将
+`KAFKA_BOOTSTRAP_SERVERS` 指向可访问的集群。默认 `.env.example` 关闭 Kafka 和 MySQL、启用
+ClickHouse，适合先验证历史导入与回放。
 
 后端已包含 Gradle Wrapper，不需要单独安装 Gradle。命令应从项目根目录执行
 `./backend/gradlew -p backend ...`，或进入 `backend/` 后执行 `./gradlew ...`。
@@ -174,7 +178,7 @@ ORDER BY completed_at;
 前端向 `/ws/replay` 发送 `replay_start`；收到任务就绪消息后自动发送一次 `replay_play`，后端会按
 时间范围选择原始文件，从 `databento_mbo_raw FINAL` 按每个文件的 `source_ordinal` 顺序读取 raw MBO，并在
 Java 状态机中逐条处理。`F_LAST` 仅用于确认一条 DBN 消息完成；服务端在每个 `bucketMs` 时间桶结束时推送该桶的
-最终盘口帧，普通模式每侧最多 100 档，`diagnostic=true` 才允许每侧最多 400 档。回放时钟根据相邻帧的事件时间差和当前倍速推进。
+最终盘口帧，普通模式每侧最多 100 档，`diagnostic=true` 才允许每侧最多 400 档。Java 引擎内部对历史和实时都按每条事件更新；页面仍按 `bucketMs` 发送每桶最后状态，回放时钟根据相邻帧的事件时间差和当前倍速推进。
 
 为保证窗口起点的队列状态正确，后端会从首个相交文件向前查找最近的 `R` reset，并从该文件开始处理预热事件；
 预热事件不会推送给浏览器。找不到 reset 时会拒绝回放，避免输出不完整订单簿。服务端按前端选定的秒数在线聚合中间价 OHLC；无需再预先返回固定数量的快照或由前端本地计时播放。
@@ -201,6 +205,14 @@ CLICKHOUSE_ENABLED=false
 MYSQL_ENABLED=false
 ```
 
+如果要用内置模拟器验证实时链路，需先提供 Kafka，再启用：
+
+```bash
+KAFKA_ENABLED=true MARKET_SIMULATOR_ENABLED=true ./backend/gradlew -p backend bootRun
+```
+
+模拟器只发送 `DEMO-USD` 的 tick、盘口和 signal，不代表真实市场数据，也不应在生产环境启用。
+
 ### 7. 启动前端
 
 ```bash
@@ -216,6 +228,15 @@ npm run dev
 
 开发服务器会把 `/api/*` 代理到 `localhost:8080`。浏览器只接收已重建的回放帧；HTTP 请求线程从
 ClickHouse 流式读取 raw 事件并在 Java 状态机中重放，不把整日 L3 数据一次性加载到内存。
+
+实时页面通过 `/ws/market` 接收 `event`、`snapshot` 和 `status` envelope。实时订单簿快照的
+`bookStatus` 为 `OK` 或 `DESYNCHRONIZED`：后者表示该 ATAS 增量流发生序号、订单或状态机错误，
+服务端会隔离该流、清空旧盘口，前端显示“盘口失同步”，不会继续展示可能过期的深度。必须关闭该
+流并以新的完整来源流重新建立订单簿后才会恢复；原始消息仍可保留在 ClickHouse 供排查。
+
+若后端不是 `8080`，或前端通过反向代理访问 WebSocket，请在构建前设置
+`VITE_WS_URL` 和 `VITE_REPLAY_WS_URL`。生产环境还应将后端的 `WS_ALLOWED_ORIGINS` 收紧为明确域名，
+不要继续使用本地的通配端口模式。
 
 ## 数据契约
 
@@ -310,14 +331,18 @@ raw 提交、目录写入和 job 完成不是一个 ClickHouse 跨表事务。�
 | `R` | 只清空当前 publisher/instrument 的订单簿 |
 | `T/F/N` | 不改变挂单状态；成交/Fill 对应的簿变化由配套 `C` 表达 |
 
-实时 ATAS 动作映射为 `New -> ADD`、`Change -> MODIFY`、`Delete -> DELETE`。其中历史 Databento
-`C` 的 `size` 是撤单量，而 ATAS `Delete` 没有撤单增量语义，状态机直接移除该活动订单的全部剩余量。
-如果 ATAS Delete 只提供 `order_id`，状态机也会按活动订单索引删除，不会静默忽略该更新。
+实时 ATAS 动作映射为 `New -> ADD`、`Change -> MODIFY`、`Delete -> DELETE（全量取消）`；Databento `A/M/C`
+分别对应新增、修改和按数量取消。统一内部订单簿结果时，ATAS `DELETE` 等价于使用活动订单当前剩余量执行一次全量 `CANCEL`，因此最终状态都是“该 order_id 不再活动”；原始 ATAS 动作仍保留为 `Delete`，不会伪造缺失的撤单数量。
+如果 ATAS Delete 只提供 `order_id`，状态机按活动订单索引删除；如果 Delete 带 side/price，则会校验它们与活动订单一致。
 
-只在带 `F_LAST` 的记录后输出状态，避免观察 publisher message 的中间态。输入若带已经派生的
+Databento 的 `source_ordinal` 是 DBN 完整解码流中的全局位置，非 MBO 记录也占位置；ATAS 的 `priority` 是供应商在订单价位队列中的优先级。两者不是同一个字段：统一规则是优先使用来源明确提供的队列优先级，缺失时才用该来源流的递增序号作为确定性回退。它们都不能跨不同流或不同合约比较。
+
+实时字段不完整的 ATAS MBO 不进入可信 L3 状态机，但不会丢失：后端写入 `atas_mbo_rejected_raw`，保留原 payload、缺失原因和可解析字段，供修复后重放。
+
+历史引擎现在每条原始记录都可输出状态；`F_LAST` 仍保留为 Databento publisher message 的审计边界，不再抑制中间事件。输入若带已经派生的
 `F_TOB` / `F_MBP` 标志会被拒绝，防止把 BBO/MBP 记录误当 MBO 再重建。
 
-严格模式将交叉盘视为不变量失败。审计模式可以保留交叉盘标记，用于与官方参考数据比对，但策略执行必须
+历史和实时生产引擎都保留交叉盘并设置 `crossed=true`；需要严格拒绝交叉盘的官方审计仍可显式创建严格引擎。策略执行必须
 过滤 `!is_complete` 或 `is_crossed=1` 的快照。
 
 ## 回放 API 与界面
@@ -371,17 +396,7 @@ docker compose exec -T clickhouse sh -lc \
   < db/migrate_mbo_file_catalog_identity.sql
 ```
 
-脚本会从 raw 表重新统计每个文件/身份的行数和时间边界。完成校验后，再单独执行：
-
-```bash
-docker compose exec -T clickhouse sh -lc \
-  'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --database market_data' \
-  < db/delete_replay_identity_zero_rows.sql
-```
-
-删除语句会清理旧的 `(publisher_id, instrument_id) = (0, 0)` 兼容行。
-
-迁移后、删除前先确认每个 raw 身份都有等行数的目录记录：
+脚本会从 raw 表重新统计每个文件/身份的行数和时间边界。迁移后、删除前先确认每个 raw 身份都有等行数的目录记录：
 
 ```sql
 SELECT raw.file_sha256, raw.publisher_id, raw.instrument_id,
@@ -402,7 +417,16 @@ LEFT JOIN
 WHERE catalog.mbo_rows IS NULL OR raw.mbo_rows != catalog.mbo_rows;
 ```
 
-该查询必须返回零行。执行清理脚本后，以下查询必须返回 `0`：
+该查询必须返回零行。然后执行以下清理命令：
+
+```bash
+docker compose exec -T clickhouse sh -lc \
+  'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --database market_data \
+   --query "ALTER TABLE market_data.databento_mbo_file_catalog DELETE WHERE publisher_id = 0 AND instrument_id = 0"'
+```
+
+仓库没有单独的删除脚本；该语句会异步清理旧的 `(publisher_id, instrument_id) = (0, 0)` 兼容行。
+在 `system.mutations` 中确认 mutation 完成后，再运行以下查询，结果必须为 `0`：
 
 ```sql
 SELECT count()
@@ -574,6 +598,20 @@ cd frontend
 npm run build
 ```
 
+官方 MBP-10/TBBO 对账（需要对应的三类 DBN 文件）：
+
+```bash
+python/.venv/bin/python python/stream_official_audit.py \
+  --mbo <同日.mbo.dbn.zst> --mbp10 <同日.mbp-10.dbn.zst> --tbbo <同日.tbbo.dbn.zst>
+python/.venv/bin/python python/validate_mbo_against_official.py \
+  --mbo <同日.mbo.dbn.zst> --mbp10 <同日.mbp-10.dbn.zst> --tbbo <同日.tbbo.dbn.zst>
+```
+
+前一条命令会把官方 DBN 解码为 Java `MboBookEngine` 的内部行协议，并按 `F_LAST`、`(sequence, ts_event)`
+对齐 MBP-10/TBBO；后一条命令执行独立的 Python 对账。也可以直接调用
+`./backend/gradlew -p backend officialOrderBookAudit`，但此时标准输入必须是
+`stream_official_audit.py` 生成的行协议，不能直接输入 JSON 或 DBN 文件。
+
 ## 常见问题
 
 ### ClickHouse 认证失败
@@ -611,6 +649,12 @@ DROP TABLE market_data.databento_mbo_raw SYNC;
 
 只有看到当前 `(publisher_id, instrument_id)` 的第一次 `R/Clear` 后才标记完整。文件从中段截取、
 缺少起始 snapshot 或数据损坏时，预热状态不能用于策略执行。
+
+### 实时页面显示“盘口失同步”
+
+这是 ATAS MBO 流被状态机隔离后的保护状态，通常由重复/倒退的 `source_sequence`、未知订单或
+不匹配的修改/删除引起。检查后端日志中的 `ATAS MBO stream desynchronized`，确认采集端重新生成
+`source_stream_id` 并从完整起点发送；不要用旧的增量消息直接填回盘口，也不要把空深度当成有效市场状态。
 
 ### `./gradle` 或 `./gradlew` 不存在
 

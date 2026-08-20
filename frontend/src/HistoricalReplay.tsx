@@ -329,7 +329,13 @@ export function HistoricalReplay() {
   })() : undefined;
   const bestBid = frame?.bids[0];
   const bestAsk = frame?.asks[0];
-  const currentPrice = frame && !frame.crossed && bestBid && bestAsk
+  const frameStatus = !frame ? 'empty' : !frame.complete ? 'incomplete' : frame.crossed ? 'crossed' : 'ready';
+  const frameStatusLabel = frameStatus === 'empty'
+    ? '等待帧'
+    : frameStatus === 'incomplete'
+      ? '预热中'
+      : frameStatus === 'crossed' ? '交叉盘' : '完整';
+  const currentPrice = frame?.complete && !frame.crossed && bestBid && bestAsk
     ? (nanoPrice(bestBid.priceNano) + nanoPrice(bestAsk.priceNano)) / 2
     : undefined;
   const currentBar = useMemo(() => {
@@ -346,8 +352,10 @@ export function HistoricalReplay() {
       ? '#168a32'
       : currentBar.closeNano < currentBar.openNano ? '#20252b' : '#667085'
     : undefined;
-  const spread = bestBid && bestAsk ? nanoPrice(bestAsk.priceNano - bestBid.priceNano) : undefined;
-  const microPrice = bestBid && bestAsk && bestBid.size + bestAsk.size > 0
+  const spread = frame?.complete && !frame.crossed && bestBid && bestAsk
+    ? nanoPrice(bestAsk.priceNano - bestBid.priceNano)
+    : undefined;
+  const microPrice = frame?.complete && !frame.crossed && bestBid && bestAsk && bestBid.size + bestAsk.size > 0
     ? (nanoPrice(bestAsk.priceNano) * bestBid.size + nanoPrice(bestBid.priceNano) * bestAsk.size)
       / (bestBid.size + bestAsk.size)
     : undefined;
@@ -512,11 +520,21 @@ export function HistoricalReplay() {
             </label>
           </div>
           <div className="depth-status">
+            <span className={`replay-frame-state replay-frame-state--${frameStatus}`}>
+              状态 <strong>{frameStatusLabel}</strong>
+            </span>
             <span>当前视图 <strong>{viewDepthLabel}</strong></span>
             <span title="当前回放帧的实际价位数；服务端每侧最多返回400档">
               买 <strong>{bidLevelCount}</strong> 档 · 卖 <strong>{askLevelCount}</strong> 档
             </span>
           </div>
+          {frameStatus !== 'empty' && frameStatus !== 'ready' && (
+            <div className={`replay-frame-note replay-frame-note--${frameStatus}`} role="status">
+              {frameStatus === 'crossed'
+                ? '交叉盘保留原始深度，仅供诊断；中间价、Spread、Microprice 与 K 线标记已屏蔽。'
+                : '首个 Clear 尚未到达，当前盘口仍处于预热状态。'}
+            </div>
+          )}
           <DomLadder
             frame={frame}
             previousFrame={previousFrame}

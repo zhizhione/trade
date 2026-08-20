@@ -172,7 +172,8 @@ public class MarketEventService {
                     // messages must not smuggle an aggregate depth payload back into the UI.
                     // Only a new stream/reset is allowed to repopulate that book.
                     String streamId = sourceStreamId(event);
-                    if (!realtimeMboBookService.isDesynchronized(streamId)) {
+                    boolean incompleteAtasMbo = "atas".equals(event.source()) && "mbo".equals(event.eventType());
+                    if (!incompleteAtasMbo && !realtimeMboBookService.isDesynchronized(streamId)) {
                         updateDepth(state, data);
                     }
                 }

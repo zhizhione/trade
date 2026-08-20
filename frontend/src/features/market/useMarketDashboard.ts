@@ -49,5 +49,13 @@ export function useMarketDashboard() {
     return bestBid === undefined || bestAsk === undefined ? undefined : bestAsk - bestBid;
   }, [snapshot]);
 
-  return { status, snapshot, events, prices, signals, spread };
+  const crossed = useMemo(() => {
+    if (!snapshot) return false;
+    if (snapshot.crossed !== undefined) return snapshot.crossed;
+    const bestBid = snapshot.bids[0]?.price;
+    const bestAsk = snapshot.asks[0]?.price;
+    return bestBid !== undefined && bestAsk !== undefined && bestBid >= bestAsk;
+  }, [snapshot]);
+
+  return { status, snapshot, events, prices, signals, spread, crossed };
 }

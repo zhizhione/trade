@@ -16,7 +16,7 @@ class MboStreamProcessorTest {
         historical.apply(historical(1, 10, 'M', 'B', 100, 5));
         historical.apply(historical(2, 10, 'C', 'B', 100, 2));
 
-        MboStreamProcessor live = new MboStreamProcessor(true, 10);
+        MboStreamProcessor live = new MboStreamProcessor(false, 10);
         MboStreamKey stream = new MboStreamKey("atas", "connection-1");
         live.accept(stream, live(0, 10, LiveMboEvent.Action.ADD, 'B', 100, 8));
         live.accept(stream, live(1, 10, LiveMboEvent.Action.MODIFY, 'B', 100, 5));
@@ -29,7 +29,7 @@ class MboStreamProcessorTest {
 
     @Test
     void isolatesLiveConnectionsWhoseSequencesBothStartAtZero() {
-        MboStreamProcessor live = new MboStreamProcessor(true, 10);
+        MboStreamProcessor live = new MboStreamProcessor(false, 10);
         MboStreamKey first = new MboStreamKey("atas", "connection-1");
         MboStreamKey second = new MboStreamKey("atas", "connection-2");
 
@@ -44,7 +44,7 @@ class MboStreamProcessorTest {
 
     @Test
     void removesAnAtasStyleDeleteWithoutInventingACancelQuantity() {
-        MboStreamProcessor live = new MboStreamProcessor(true, 10);
+        MboStreamProcessor live = new MboStreamProcessor(false, 10);
         MboStreamKey stream = new MboStreamKey("atas", "connection-1");
         live.accept(stream, live(0, 10, LiveMboEvent.Action.ADD, 'A', 101, 7));
         live.accept(stream, live(1, 10, LiveMboEvent.Action.DELETE, 'A', 101, 0));
@@ -54,7 +54,7 @@ class MboStreamProcessorTest {
 
     @Test
     void appliesExplicitAtasPriorityChangesEvenWhenPriceAndSizeStayTheSame() {
-        MboStreamProcessor live = new MboStreamProcessor(true, 10);
+        MboStreamProcessor live = new MboStreamProcessor(false, 10);
         MboStreamKey stream = new MboStreamKey("atas", "priority-stream");
         live.accept(stream, live(0, 10, LiveMboEvent.Action.ADD, 'B', 100, 5, 10L));
         live.accept(stream, live(1, 11, LiveMboEvent.Action.ADD, 'B', 100, 5, 20L));

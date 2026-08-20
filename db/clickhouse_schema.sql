@@ -137,6 +137,37 @@ PARTITION BY toYYYYMMDD(received_utc)
 ORDER BY (canonical_id, source_stream_id, source_sequence)
 SETTINGS index_granularity = 8192;
 
+-- 保留因字段不完整而未进入 L3 状态机的 ATAS MBO 原始消息，便于补数、审计和重放。
+CREATE TABLE IF NOT EXISTS market_data.atas_mbo_rejected_raw
+(
+    event_id String COMMENT '标准化事件 ID；仅用于关联日志和原始 payload，不作为唯一事件身份',
+    topic String COMMENT '原始 Kafka topic',
+    source_stream_id Nullable(String) COMMENT '原始流会话 ID；格式错误时仍保留文本',
+    source_sequence Nullable(UInt64) COMMENT '原始来源序号；缺失或非法时为 NULL',
+    received_utc DateTime64(7, 'UTC') COMMENT '接收时间',
+    event_time_utc DateTime64(7, 'UTC') COMMENT '解析后的事件时间',
+    event_time_raw String COMMENT '原始事件时间文本',
+    event_time_kind LowCardinality(String) COMMENT '时间类型语义',
+    canonical_id Nullable(UInt64) COMMENT '上游提供的合约身份；缺失时为 NULL',
+    root_symbol LowCardinality(String),
+    contract_symbol LowCardinality(String),
+    exchange LowCardinality(String),
+    update_type LowCardinality(String),
+    side LowCardinality(String),
+    priority Nullable(UInt64),
+    exchange_order_id Nullable(UInt64),
+    price Nullable(Decimal64(9)),
+    price_nano Nullable(Int64),
+    volume Nullable(UInt64),
+    rejection_reason LowCardinality(String),
+    payload String COMMENT '完整标准化原始 JSON payload',
+    ingested_at DateTime64(3, 'UTC') DEFAULT now64(3)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(received_utc)
+ORDER BY (received_utc, event_id)
+SETTINGS index_granularity = 8192;
+
 CREATE TABLE IF NOT EXISTS market_data.atas_trade_raw
 (
     schema_version UInt16 COMMENT 'ATAS 采集消息的 JSON 结构版本；对应样本中的 schema_version',

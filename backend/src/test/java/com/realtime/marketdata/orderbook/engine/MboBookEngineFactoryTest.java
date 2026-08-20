@@ -21,6 +21,14 @@ class MboBookEngineFactoryTest {
         assertThat(snapshotBidCount(MboBookEngine::new)).isEqualTo(MboBookEngine.MAX_DEPTH);
     }
 
+    @Test
+    void historicalAndLiveEnginesBothRetainCrossedBooks() {
+        MboBookEngineFactory factory = new MboBookEngineFactory();
+
+        assertThat(crossed(factory.createHistorical())).isTrue();
+        assertThat(crossed(factory.createLive())).isTrue();
+    }
+
     private int snapshotBidCount(Supplier<MboBookEngine> engineSupplier) {
         MboBookEngine engine = engineSupplier.get();
         for (int level = 0; level < MboBookEngine.MAX_DEPTH + 50; level++) {
@@ -50,5 +58,12 @@ class MboBookEngineFactoryTest {
             0,
             level
         );
+    }
+
+    private boolean crossed(MboBookEngine engine) {
+        engine.apply(new MboEvent(0, 1, 1, 160, 1, 750, 'A', 'B', 100, 1, 0, 1, 0, 0, 0));
+        return engine.apply(new MboEvent(1, 2, 2, 160, 1, 750, 'A', 'A', 100, 1, 0, 2, 0, 0, 1))
+            .orElseThrow()
+            .crossed();
     }
 }

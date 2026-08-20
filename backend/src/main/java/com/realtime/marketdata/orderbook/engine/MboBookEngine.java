@@ -42,14 +42,14 @@ public final class MboBookEngine {
     private boolean hasAppliedEvent;
     private long lastSourceOrdinal;
 
-    /** 创建默认实时引擎：发现交叉盘即失败，适用于生产校验和执行场景。 */
+    /** 创建默认引擎：发现交叉盘时抛出不变量异常，适用于需要严格校验的调用方。 */
     public MboBookEngine() {
         this(true, DEFAULT_DEPTH);
     }
 
     /**
-     * 验证和研究调用方可关闭实时交叉盘拒绝，以保留带有 {@code crossed} 标记的异常快照；
-     * 历史事件始终按源记录逐条应用，不再启用独立的严格历史事务模式。
+     * 调用方可选择是否拒绝交叉盘。历史和实时生产回放均可关闭该拒绝并保留
+     * {@code crossed} 标记；需要严格校验的审计调用方可显式开启。
      */
     public MboBookEngine(boolean rejectCrossedBooks) {
         this(rejectCrossedBooks, DEFAULT_DEPTH);
@@ -62,8 +62,8 @@ public final class MboBookEngine {
     }
 
     /**
-     * 应用一条历史事件。只有到达 {@link #F_LAST} 消息边界时才返回快照，这与 Databento
-     * 的消息分帧一致，避免把半条消息的中间状态暴露给下游。
+     * 应用一条历史事件。每条原始事件应用后都返回当前快照，使历史与实时通路使用相同的
+     * “一条输入对应一条输出”规则；{@link #F_LAST} 仍保留在原始字段中供审计识别消息边界。
      */
     public Optional<BookSnapshot> apply(MboEvent event) {
         requireStrictlyIncreasingOrdinal(event.sourceOrdinal());
@@ -97,11 +97,7 @@ public final class MboBookEngine {
 
     private BookSnapshot applyHistoricalBook(BookKey key, OrderBook book, MboEvent event) {
         book.apply(event);
-        if ((event.flags() & F_LAST) == 0) {
-            return null;
-        }
-        BookSnapshot snapshot = book.snapshot(key, event, snapshotDepth);
-        return snapshot;
+        return book.snapshot(key, event, snapshotDepth);
     }
 
     private BookSnapshot applyLiveBook(BookKey key, OrderBook book, LiveMboEvent event) {

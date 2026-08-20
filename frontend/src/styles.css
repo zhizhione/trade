@@ -84,6 +84,7 @@ h2 { margin: 3px 0 0; font-size: 16px; letter-spacing: -0.01em; }
   color: #f4bd50;
   font-size: 12px;
 }
+.book-warning--crossed { color: #f08a4b; }
 
 .book-status {
   margin-left: auto;
@@ -94,6 +95,7 @@ h2 { margin: 3px 0 0; font-size: 16px; letter-spacing: -0.01em; }
 
 .book-status--ok { color: #40e0c1; background: rgba(64, 224, 193, 0.1); }
 .book-status--error { color: #eb6676; background: rgba(235, 102, 118, 0.12); }
+.book-status--crossed { color: #f08a4b; background: rgba(240, 138, 75, 0.14); }
 .book-empty {
   display: grid;
   min-height: 280px;
@@ -513,6 +515,19 @@ h2 { margin: 3px 0 0; font-size: 16px; letter-spacing: -0.01em; }
   white-space: nowrap;
 }
 .depth-status strong { color: #344054; font-size: 11px; }
+.replay-frame-state--ready strong { color: #027a48; }
+.replay-frame-state--incomplete strong { color: #b54708; }
+.replay-frame-state--crossed strong { color: #b54708; }
+.replay-frame-note {
+  padding: 6px 11px;
+  border-bottom: 1px solid var(--terminal-line);
+  color: #667085;
+  background: #fffaeb;
+  font-size: 10px;
+  line-height: 1.35;
+}
+.replay-frame-note--crossed { color: #8a4b08; }
+.replay-frame-note--incomplete { color: #694b00; }
 .depth-status button {
   padding: 2px 0;
   border: 0;

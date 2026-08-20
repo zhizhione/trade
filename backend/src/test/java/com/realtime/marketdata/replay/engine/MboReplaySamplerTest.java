@@ -14,7 +14,7 @@ import org.junit.jupiter.api.Test;
 class MboReplaySamplerTest {
 
     @Test
-    void retainsOnlyTheLastFLastSnapshotWithinEachBucket() {
+    void retainsOnlyTheLastEventSnapshotWithinEachBucket() {
         MboReplaySampler sampler = new MboReplaySampler(100, 10, false);
         sampler.accept(event(0, 10_000_000, 1, 'R', 'N', 0, 0, MboBookEngine.F_LAST));
         sampler.accept(event(1, 20_000_000, 2, 'A', 'B', 100, 4, MboBookEngine.F_LAST));

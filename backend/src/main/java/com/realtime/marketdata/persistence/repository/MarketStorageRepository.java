@@ -145,10 +145,7 @@ public class MarketStorageRepository implements MarketEventStore {
         Long orderId = requiredUnsigned(event, "exchange_order_id", "exchangeOrderId", "order_id", "orderId");
         if (streamId == null || canonicalId == null || sequence == null || orderId == null
             || (!delete && (price == null || volume == null))) {
-            log.warn(
-                "Skipping incomplete ATAS MBO event {}: source stream, canonical_id, sequence and order_id are required; price/volume are required except for Delete",
-                event.eventId()
-            );
+            saveRejectedAtasMbo(event, rejectionReason(streamId, canonicalId, sequence, orderId, delete, price, volume));
             return;
         }
 
@@ -178,6 +175,55 @@ public class MarketStorageRepository implements MarketEventStore {
             setNullableDecimal(statement, 16, price);
             setNullableLong(statement, 17, price == null ? null : priceNano(event, price));
             setNullableLong(statement, 18, volume);
+        });
+    }
+
+    private String rejectionReason(
+        UUID streamId, Long canonicalId, Long sequence, Long orderId, boolean delete,
+        BigDecimal price, Long volume
+    ) {
+        if (streamId == null) return "invalid_or_missing_source_stream_id";
+        if (canonicalId == null) return "missing_canonical_id";
+        if (sequence == null) return "missing_or_invalid_source_sequence";
+        if (orderId == null) return "missing_or_invalid_exchange_order_id";
+        if (!delete && price == null) return "missing_or_invalid_price";
+        if (!delete && volume == null) return "missing_or_invalid_volume";
+        return "invalid_atas_mbo";
+    }
+
+    /** 保留未进入 L3 状态机的原始 ATAS MBO，避免坏消息只能在日志中消失。 */
+    private void saveRejectedAtasMbo(MarketEvent event, String reason) {
+        String sql = """
+            INSERT INTO market_data.atas_mbo_rejected_raw
+                (event_id, topic, source_stream_id, source_sequence, received_utc, event_time_utc,
+                 event_time_raw, event_time_kind, canonical_id, root_symbol, contract_symbol,
+                 exchange, update_type, side, priority, exchange_order_id, price, price_nano,
+                 volume, rejection_reason, payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """;
+        write("ATAS rejected MBO", event, sql, (statement, connection) -> {
+            setStringOrNull(statement, 1, event.eventId());
+            setStringOrNull(statement, 2, event.topic());
+            setStringOrNull(statement, 3, text(event, "source_stream_id", "sourceStreamId", "stream_id", "streamId"));
+            setNullableLong(statement, 4, requiredSequence(event));
+            statement.setTimestamp(5, Timestamp.from(receivedAt(event)));
+            statement.setTimestamp(6, Timestamp.from(event.eventTime()));
+            statement.setString(7, eventTimeRaw(event));
+            statement.setString(8, eventTimeKind(event));
+            setNullableLong(statement, 9, event.canonicalId());
+            statement.setString(10, textOrDefault(event, event.symbol(), "root_symbol", "rootSymbol", "root"));
+            statement.setString(11, textOrDefault(event, event.symbol(), "contract_symbol", "contractSymbol", "contract"));
+            statement.setString(12, textOrDefault(event, "UNKNOWN", "exchange", "venue"));
+            statement.setString(13, textOrDefault(event, "Unknown", "update_type", "updateType", "action", "type"));
+            statement.setString(14, textOrDefault(event, "Unknown", "side"));
+            setNullableLong(statement, 15, nullableLong(event, "priority", "queue_priority", "queuePriority"));
+            setNullableLong(statement, 16, nullableLong(event, "exchange_order_id", "exchangeOrderId", "order_id", "orderId"));
+            BigDecimal price = decimal(event, "price", "px");
+            setNullableDecimal(statement, 17, price);
+            setNullableLong(statement, 18, price == null ? null : priceNano(event, price));
+            setNullableLong(statement, 19, nullableLong(event, "volume", "quantity", "qty", "size"));
+            statement.setString(20, reason);
+            statement.setString(21, event.data() == null ? "{}" : event.data().toString());
         });
     }
 
@@ -610,6 +656,14 @@ public class MarketStorageRepository implements MarketEventStore {
             statement.setNull(index, Types.BIGINT);
         } else {
             statement.setLong(index, value);
+        }
+    }
+
+    private void setStringOrNull(PreparedStatement statement, int index, String value) throws SQLException {
+        if (value == null) {
+            statement.setNull(index, Types.VARCHAR);
+        } else {
+            statement.setString(index, value);
         }
     }
 

@@ -6,8 +6,9 @@ import { formatNumber } from './shared/format';
 import { formatNewYorkTime } from './time';
 
 export default function App() {
-  const { status, snapshot, events, prices, signals, spread } = useMarketDashboard();
+  const { status, snapshot, events, prices, signals, spread, crossed } = useMarketDashboard();
   const bookDesynchronized = snapshot?.bookStatus === 'DESYNCHRONIZED';
+  const bookCrossed = !bookDesynchronized && crossed;
 
   return (
     <main className="shell">
@@ -21,6 +22,7 @@ export default function App() {
           {status === 'connected' ? '实时连接' : status === 'connecting' ? '正在连接' : '等待重连'}
         </div>
         {bookDesynchronized && <div className="book-warning">盘口失同步，等待重新快照</div>}
+        {bookCrossed && <div className="book-warning book-warning--crossed">盘口交叉，仅供诊断</div>}
       </header>
 
       <section className="ticker-strip">
@@ -34,7 +36,9 @@ export default function App() {
         </div>
         <div>
           <span className="metric-label">买卖价差</span>
-          <strong>{formatNumber(spread, 6)}</strong>
+          <strong className={spread !== undefined && spread < 0 ? 'negative' : undefined}>
+            {formatNumber(spread, 6)}
+          </strong>
         </div>
         <div>
           <span className="metric-label">订单流</span>
@@ -66,8 +70,8 @@ export default function App() {
               <span className="panel__kicker">ORDER BOOK</span>
               <h2>盘口深度</h2>
             </div>
-            <span className={`book-status ${bookDesynchronized ? 'book-status--error' : 'book-status--ok'}`}>
-              {bookDesynchronized ? '不可用' : '正常'}
+            <span className={`book-status ${bookDesynchronized ? 'book-status--error' : bookCrossed ? 'book-status--crossed' : 'book-status--ok'}`}>
+              {bookDesynchronized ? '不可用' : bookCrossed ? '交叉盘' : '正常'}
             </span>
           </div>
           {bookDesynchronized ? (

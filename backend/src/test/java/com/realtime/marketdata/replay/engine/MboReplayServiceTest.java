@@ -93,7 +93,7 @@ class MboReplayServiceTest {
         ReplaySession session = new MboReplayService(source)
             .session(1, 750, 100, 0, 120, 10, 1_000);
 
-        // HTTP 回放每个 100 毫秒时间桶只输出一帧最终的 F_LAST 快照。
+        // HTTP 回放每个 100 毫秒时间桶只输出一帧最终的源顺序快照；引擎内部仍逐事件更新。
         assertThat(session.frames()).extracting(ReplayFrame::timeMs)
             .containsExactly(0L, 100L);
         assertThat(session.frames()).allSatisfy(frame -> assertThat(frame.crossed()).isTrue());
