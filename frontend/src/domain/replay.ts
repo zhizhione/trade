@@ -44,6 +44,8 @@ export interface ReplayFrame {
   complete: boolean;
   /** 最优买价大于等于最优卖价时为 true；策略不应将其作为有效 BBO。 */
   crossed: boolean;
+  /** Equal best bid/ask; retained for diagnostics. */
+  locked?: boolean;
 }
 
 export interface ReplayBar {

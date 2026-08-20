@@ -41,6 +41,9 @@ dependencies {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    // Allow opt-in real JSON consistency regressions without making fixtures mandatory in CI.
+    System.getProperty("mbo.json")?.let { systemProperty("mbo.json", it) }
+    System.getProperty("atas.json")?.let { systemProperty("atas.json", it) }
 }
 
 tasks.register<JavaExec>("officialOrderBookAudit") {

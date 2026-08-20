@@ -42,9 +42,9 @@ public final class MboBookEngine {
     private boolean hasAppliedEvent;
     private long lastSourceOrdinal;
 
-    /** 创建默认引擎：发现交叉盘时抛出不变量异常，适用于需要严格校验的调用方。 */
+    /** 创建默认生产引擎：保留交叉盘并在快照中设置 {@code crossed=true}。 */
     public MboBookEngine() {
-        this(true, DEFAULT_DEPTH);
+        this(false, DEFAULT_DEPTH);
     }
 
     /**
@@ -61,81 +61,45 @@ public final class MboBookEngine {
         this.snapshotDepth = snapshotDepth;
     }
 
-    /**
-     * 应用一条历史事件。每条原始事件应用后都返回当前快照，使历史与实时通路使用相同的
-     * “一条输入对应一条输出”规则；{@link #F_LAST} 仍保留在原始字段中供审计识别消息边界。
-     */
+    /** 将 Databento 原始事件适配为统一订单簿更新。 */
     public Optional<BookSnapshot> apply(MboEvent event) {
+        return apply(BookUpdate.fromDatabento(event));
+    }
+
+    /** 将实时供应商事件适配为统一订单簿更新。 */
+    public Optional<BookSnapshot> apply(LiveMboEvent event) {
+        return apply(BookUpdate.fromLive(event));
+    }
+
+    /**
+     * 应用一条规范化订单簿更新。历史 Databento 与实时 ATAS 最终都只经过这一套状态迁移、
+     * 队列优先级、交叉盘判断和快照生成逻辑；来源差异只存在于 {@link BookUpdate} 适配阶段。
+     */
+    public Optional<BookSnapshot> apply(BookUpdate event) {
         requireStrictlyIncreasingOrdinal(event.sourceOrdinal());
         if ((event.flags() & (F_TOB | F_MBP)) != 0) {
             throw new MboBookInvariantException("MBO engine rejects F_TOB/F_MBP records");
         }
 
-        BookKey key = new BookKey(event.publisherId(), event.instrumentId());
-        BookSnapshot snapshot = applyHistoricalBook(
-            key, books.computeIfAbsent(key, ignored -> new OrderBook()), event
-        );
-        hasAppliedEvent = true;
-        lastSourceOrdinal = event.sourceOrdinal();
-        return Optional.ofNullable(snapshot);
-    }
-
-    /**
-     * 应用一条归一化后的实时 L3 更新。与 DBN 数据不同，每条实时更新均视为完整消息，
-     * 因此每次状态更新后都会返回快照。
-     */
-    public Optional<BookSnapshot> apply(LiveMboEvent event) {
-        requireStrictlyIncreasingOrdinal(event.sourceOrdinal());
-
-        BookKey key = new BookKey(event.publisherId(), event.instrumentId());
+        BookKey key = event.key();
         OrderBook book = books.computeIfAbsent(key, ignored -> new OrderBook());
-        BookSnapshot snapshot = applyLiveBook(key, book, event);
+        if (rejectCrossedBooks && createsCrossing(event.action())) {
+            OrderBook candidate = book.copy();
+            candidate.apply(event);
+            requireNotCrossed(candidate.snapshot(event, snapshotDepth), event.sourceOrdinal());
+        }
+        book.apply(event);
+        BookSnapshot snapshot = book.snapshot(event, snapshotDepth);
+        if (rejectCrossedBooks) {
+            requireNotCrossed(snapshot, event.sourceOrdinal());
+        }
         hasAppliedEvent = true;
         lastSourceOrdinal = event.sourceOrdinal();
         return Optional.of(snapshot);
     }
 
-    private BookSnapshot applyHistoricalBook(BookKey key, OrderBook book, MboEvent event) {
-        book.apply(event);
-        return book.snapshot(key, event, snapshotDepth);
-    }
-
-    private BookSnapshot applyLiveBook(BookKey key, OrderBook book, LiveMboEvent event) {
-        if (rejectCrossedBooks && createsCrossing(event.action())) {
-            OrderBook candidate = book.copy();
-            candidate.apply(event);
-            requireNotCrossed(candidate.snapshot(
-                key,
-                event.sourceOrdinal(),
-                event.tsEventNs(),
-                event.tsRecvNs(),
-                event.sequence(),
-                event.action().snapshotAction(),
-                event.side(),
-                snapshotDepth
-            ), event.sourceOrdinal());
-            book.apply(event);
-        } else {
-            book.apply(event);
-        }
-        BookSnapshot snapshot = book.snapshot(
-            key,
-            event.sourceOrdinal(),
-            event.tsEventNs(),
-            event.tsRecvNs(),
-            event.sequence(),
-            event.action().snapshotAction(),
-            event.side(),
-            snapshotDepth
-        );
-        if (rejectCrossedBooks) {
-            requireNotCrossed(snapshot, event.sourceOrdinal());
-        }
-        return snapshot;
-    }
-
-    private static boolean createsCrossing(LiveMboEvent.Action action) {
-        return action == LiveMboEvent.Action.ADD || action == LiveMboEvent.Action.MODIFY;
+    private static boolean createsCrossing(BookUpdate.Action action) {
+        return action == BookUpdate.Action.ADD || action == BookUpdate.Action.MODIFY;
     }
 
     private static void requireNotCrossed(BookSnapshot snapshot, long sourceOrdinal) {
@@ -154,8 +118,8 @@ public final class MboBookEngine {
         BookKey key = new BookKey(publisherId, instrumentId);
         OrderBook book = books.get(key);
         return book == null
-            ? new BookSnapshot(key, -1L, 0L, 0L, 0L, 'N', 'N', List.of(), List.of(), false)
-            : book.snapshot(key, -1L, 0L, 0L, 0L, 'N', 'N', depth);
+            ? new BookSnapshot(key, -1L, 0L, 0L, 0L, 'N', 'N', List.of(), List.of(), false, false)
+            : book.snapshot(key, depth);
     }
 
     /** 返回某一价位的活跃订单队列，供需要队列位置的回测或诊断逻辑使用。 */
@@ -187,6 +151,109 @@ public final class MboBookEngine {
     public record BookKey(int publisherId, long instrumentId) {
     }
 
+    /**
+     * 与来源协议无关的一条订单簿更新。Databento/ATAS 只在进入引擎前映射到这里，避免核心
+     * 状态机为每种来源维护一套几乎相同的动作逻辑。
+     */
+    public record BookUpdate(
+        long sourceOrdinal,
+        long tsEventNs,
+        long tsRecvNs,
+        BookKey key,
+        Action action,
+        char side,
+        long priceNano,
+        long size,
+        long orderId,
+        long sequence,
+        Long priority,
+        int flags
+    ) {
+        public BookUpdate {
+            if (key == null) throw new IllegalArgumentException("book key is required");
+            if (action == null) throw new IllegalArgumentException("book action is required");
+        }
+
+        /**
+         * Returns the provenance of the queue priority used by the engine.  Databento MBO
+         * records do not carry the ATAS queue-priority field, so a null priority is deliberately
+         * represented as a deterministic source-order fallback rather than as a native priority.
+         */
+        public PrioritySource prioritySource() {
+            return priority == null ? PrioritySource.SOURCE_ORDINAL_FALLBACK : PrioritySource.NATIVE;
+        }
+
+        public enum PrioritySource {
+            NATIVE,
+            SOURCE_ORDINAL_FALLBACK
+        }
+
+        public static BookUpdate fromDatabento(MboEvent event) {
+            return new BookUpdate(
+                event.sourceOrdinal(), event.tsEventNs(), event.tsRecvNs(),
+                new BookKey(event.publisherId(), event.instrumentId()),
+                Action.fromDatabento(event.action()), event.side(), event.priceNano(), event.size(),
+                event.orderId(), event.sequence(), null, event.flags()
+            );
+        }
+
+        public static BookUpdate fromLive(LiveMboEvent event) {
+            return new BookUpdate(
+                event.sourceOrdinal(), event.tsEventNs(), event.tsRecvNs(),
+                new BookKey(event.publisherId(), event.instrumentId()),
+                Action.fromLive(event.action()), event.side(), event.priceNano(), event.size(),
+                event.orderId(), event.sequence(), event.priority(), 0
+            );
+        }
+
+        public enum Action {
+            ADD('A'),
+            MODIFY('M'),
+            CANCEL('C'),
+            DELETE('C'),
+            CLEAR('R'),
+            TRADE('T'),
+            FILL('F'),
+            NOOP('N');
+
+            private final char snapshotAction;
+
+            Action(char snapshotAction) {
+                this.snapshotAction = snapshotAction;
+            }
+
+            public char snapshotAction() {
+                return snapshotAction;
+            }
+
+            private static Action fromDatabento(char action) {
+                return switch (action) {
+                    case 'A' -> ADD;
+                    case 'M' -> MODIFY;
+                    case 'C' -> CANCEL;
+                    case 'R' -> CLEAR;
+                    case 'T' -> TRADE;
+                    case 'F' -> FILL;
+                    case 'N' -> NOOP;
+                    default -> throw new MboBookInvariantException("unsupported MBO action=" + action);
+                };
+            }
+
+            private static Action fromLive(LiveMboEvent.Action action) {
+                return switch (action) {
+                    case ADD -> ADD;
+                    case MODIFY -> MODIFY;
+                    case CANCEL -> CANCEL;
+                    case DELETE -> DELETE;
+                    case CLEAR -> CLEAR;
+                    case TRADE -> TRADE;
+                    case FILL -> FILL;
+                    case NOOP -> NOOP;
+                };
+            }
+        }
+    }
+
     public record Level(long priceNano, long size, int orderCount) {
         public Level {
             if (size <= 0 || orderCount <= 0) {
@@ -208,8 +275,26 @@ public final class MboBookEngine {
         char side,
         List<Level> bids,
         List<Level> asks,
-        boolean crossed
+        boolean crossed,
+        boolean locked
     ) {
+        /** Backwards-compatible constructor for callers compiled against the crossed-only contract. */
+        public BookSnapshot(
+            BookKey key,
+            long sourceOrdinal,
+            long tsEventNs,
+            long tsRecvNs,
+            long sequence,
+            char action,
+            char side,
+            List<Level> bids,
+            List<Level> asks,
+            boolean crossed
+        ) {
+            this(key, sourceOrdinal, tsEventNs, tsRecvNs, sequence, action, side,
+                bids, asks, crossed, false);
+        }
+
         public BookSnapshot {
             bids = List.copyOf(bids);
             asks = List.copyOf(asks);
@@ -233,26 +318,15 @@ public final class MboBookEngine {
         private final NavigableMap<Long, PriceLevel> bids = new TreeMap<>();
         private final NavigableMap<Long, PriceLevel> asks = new TreeMap<>();
 
-        private void apply(MboEvent event) {
-            switch (event.action()) {
-                case 'A' -> add(event);
-                case 'M' -> modify(event);
-                case 'C' -> cancel(event);
-                case 'R' -> clear();
-                // 成交、成交填充和无操作记录携带成交或分帧信息，但不会直接变更挂单表。
-                // 若某交易所明确规定 fill 应扣减剩余量，可在后续接入层加入对应策略。
-                case 'T', 'F', 'N' -> { }
-                default -> throw new MboBookInvariantException("unsupported MBO action=" + event.action());
-            }
-        }
-
-        private void apply(LiveMboEvent event) {
+        private void apply(BookUpdate event) {
             switch (event.action()) {
                 case ADD -> add(event);
                 case MODIFY -> modify(event);
-                case CANCEL -> cancel(asHistoricalEvent(event, 'C'));
+                case CANCEL -> cancel(event);
                 case DELETE -> delete(event);
                 case CLEAR -> clear();
+                // 成交、成交填充和无操作记录携带成交或分帧信息，但不会直接变更挂单表。
+                // 若某交易所明确规定 fill 应扣减剩余量，可在后续接入层加入对应策略。
                 case TRADE, FILL, NOOP -> { }
             }
         }
@@ -280,36 +354,9 @@ public final class MboBookEngine {
             target.level(order.side, order.priceNano, true).orders.put(order.orderId, order);
         }
 
-        private MboEvent asHistoricalEvent(LiveMboEvent event, char action) {
-            // 实时适配器完成来源语义归一化后，内部价位迁移与历史事件完全一致。
-            // 此处 rtype/flags 仅用于构造兼容事件，不会作为实时原始数据持久化。
-            return new MboEvent(
-                event.sourceOrdinal(), event.tsRecvNs(), event.tsEventNs(), 160,
-                event.publisherId(), event.instrumentId(), action, event.side(),
-                event.priceNano(), event.size(), 0, event.orderId(), F_LAST, 0, event.sequence()
-            );
-        }
-
-        private void add(MboEvent event) {
-            requireBookSide(event);
-            if (event.size() == 0) {
-                throw new MboBookInvariantException("zero-size Add");
-            }
-            if (orders.containsKey(event.orderId())) {
-                throw new MboBookInvariantException(
-                    "duplicate active order_id=" + Long.toUnsignedString(event.orderId())
-                );
-            }
-            RestingOrder order = new RestingOrder(
-                event.orderId(), event.side(), event.priceNano(), event.size(), event.sourceOrdinal()
-            );
-            orders.put(order.orderId, order);
-            level(order.side, order.priceNano, true).orders.put(order.orderId, order);
-        }
-
-        private void add(LiveMboEvent event) {
+        private void add(BookUpdate event) {
             requireBookSide(event.side());
-            if (event.size() == 0) {
+            if (event.size() <= 0) {
                 throw new MboBookInvariantException("zero-size Add");
             }
             if (orders.containsKey(event.orderId())) {
@@ -317,6 +364,8 @@ public final class MboBookEngine {
                     "duplicate active order_id=" + Long.toUnsignedString(event.orderId())
                 );
             }
+            // sourceOrdinal identifies raw position. Queue priority is separate; when absent,
+            // the strictly ordered source position is the deterministic queue-order fallback.
             long priority = event.priority() == null ? event.sourceOrdinal() : event.priority();
             RestingOrder order = new RestingOrder(
                 event.orderId(), event.side(), event.priceNano(), event.size(), priority
@@ -325,9 +374,9 @@ public final class MboBookEngine {
             level(order.side, order.priceNano, true).orders.put(order.orderId, order);
         }
 
-        private void modify(MboEvent event) {
-            requireBookSide(event);
-            if (event.size() == 0) {
+        private void modify(BookUpdate event) {
+            requireBookSide(event.side());
+            if (event.size() <= 0) {
                 throw new MboBookInvariantException("zero-size Modify");
             }
             RestingOrder old = requireOrder(event.orderId(), "Modify");
@@ -336,64 +385,25 @@ public final class MboBookEngine {
             }
 
             // CME 风格队列规则：改价或增量会失去原有时间优先级；同价减量保留原队列位置。
-            boolean losesPriority = old.priceNano != event.priceNano() || old.size < event.size();
-            PriceLevel oldLevel = level(old.side, old.priceNano, false);
-            oldLevel.orders.remove(old.orderId);
-            removeLevelIfEmpty(old.side, old.priceNano, oldLevel);
-
-            long priorityOrdinal = losesPriority ? event.sourceOrdinal() : old.priorityOrdinal;
-            RestingOrder updated = new RestingOrder(
-                old.orderId, old.side, event.priceNano(), event.size(), priorityOrdinal
-            );
-            orders.put(updated.orderId, updated);
-            PriceLevel newLevel = level(updated.side, updated.priceNano, true);
-            if (losesPriority) {
-                // 改价或增量后，订单以新的优先级重新进入该价位队列末尾。
-                newLevel.orders.put(updated.orderId, updated);
-            } else {
-                // 同价减量不改变时间优先级，仍保留原始入队顺序。
-                insertByPriority(newLevel, updated);
-            }
-        }
-
-        private void modify(LiveMboEvent event) {
-            requireBookSide(event.side());
-            if (event.size() == 0) {
-                throw new MboBookInvariantException("zero-size Modify");
-            }
-            RestingOrder old = requireOrder(event.orderId(), "Modify");
-            if (old.side != event.side()) {
-                throw new MboBookInvariantException("Modify changed side");
-            }
-
             boolean priorityChanged = event.priority() != null
                 && Long.compareUnsigned(event.priority(), old.priorityOrdinal) != 0;
-            if (old.priceNano == event.priceNano() && old.size == event.size() && !priorityChanged) {
-                // An explicit unchanged provider priority is a semantic no-op. Replacing the
-                // value in-place preserves its exact position among equal-priority orders.
-                RestingOrder unchanged = new RestingOrder(
-                    old.orderId, old.side, old.priceNano, old.size, old.priorityOrdinal
-                );
-                orders.put(unchanged.orderId, unchanged);
-                level(old.side, old.priceNano, false).orders.put(unchanged.orderId, unchanged);
-                return;
-            }
             boolean losesPriority = old.priceNano != event.priceNano() || old.size < event.size()
                 || priorityChanged;
             PriceLevel oldLevel = level(old.side, old.priceNano, false);
             oldLevel.orders.remove(old.orderId);
             removeLevelIfEmpty(old.side, old.priceNano, oldLevel);
 
-            long priority = event.priority() != null
+            long priorityOrdinal = event.priority() != null
                 ? event.priority()
                 : (losesPriority ? event.sourceOrdinal() : old.priorityOrdinal);
             RestingOrder updated = new RestingOrder(
-                old.orderId, old.side, event.priceNano(), event.size(), priority
+                old.orderId, old.side, event.priceNano(), event.size(), priorityOrdinal
             );
             orders.put(updated.orderId, updated);
             PriceLevel newLevel = level(updated.side, updated.priceNano, true);
             if (losesPriority) {
                 if (event.priority() == null) {
+                    // 没有来源 priority 时，规范化 source ordinal 作为队尾回退。
                     newLevel.orders.put(updated.orderId, updated);
                 } else {
                     insertByPriority(newLevel, updated);
@@ -420,13 +430,13 @@ public final class MboBookEngine {
             level.orders.putAll(rebuilt);
         }
 
-        private void cancel(MboEvent event) {
-            requireBookSide(event);
+        private void cancel(BookUpdate event) {
+            requireBookSide(event.side());
             RestingOrder old = requireOrder(event.orderId(), "Cancel");
             if (old.side != event.side() || old.priceNano != event.priceNano()) {
                 throw new MboBookInvariantException("Cancel side/price differs from active order");
             }
-            if (event.size() == 0 || event.size() > old.size) {
+            if (event.size() <= 0 || event.size() > old.size) {
                 throw new MboBookInvariantException("invalid Cancel size");
             }
 
@@ -444,7 +454,7 @@ public final class MboBookEngine {
             }
         }
 
-        private void delete(LiveMboEvent event) {
+        private void delete(BookUpdate event) {
             RestingOrder old = requireOrder(event.orderId(), "Delete");
             if (event.side() != 'N' && old.side != event.side()) {
                 throw new MboBookInvariantException("Delete side differs from active order");
@@ -487,31 +497,24 @@ public final class MboBookEngine {
             return List.copyOf(result);
         }
 
-        private BookSnapshot snapshot(BookKey key, MboEvent event, int depth) {
-            return snapshot(
-                key, event.sourceOrdinal(), event.tsEventNs(), event.tsRecvNs(), event.sequence(),
-                event.action(), event.side(), depth
-            );
+        private BookSnapshot snapshot(BookKey key, int depth) {
+            return snapshot(new BookUpdate(
+                -1L, 0L, 0L, key, BookUpdate.Action.NOOP, 'N', 0L, 0L, 0L, 0L, null, 0
+            ), depth);
         }
 
-        private BookSnapshot snapshot(
-            BookKey key,
-            long sourceOrdinal,
-            long tsEventNs,
-            long tsRecvNs,
-            long sequence,
-            char action,
-            char side,
-            int depth
-        ) {
+        private BookSnapshot snapshot(BookUpdate event, int depth) {
             List<Level> bidLevels = aggregate(bids.descendingMap(), depth);
             List<Level> askLevels = aggregate(asks, depth);
-            // 交叉盘作为可审计的异常信号保留；实时严格校验在状态迁移前由调用方完成。
+            // 交叉盘作为可审计的异常信号保留；严格模式由统一 apply 在提交前校验候选簿。
+            boolean locked = !bidLevels.isEmpty() && !askLevels.isEmpty()
+                && bidLevels.getFirst().priceNano() == askLevels.getFirst().priceNano();
             boolean crossed = !bidLevels.isEmpty() && !askLevels.isEmpty()
                 && bidLevels.getFirst().priceNano() >= askLevels.getFirst().priceNano();
             return new BookSnapshot(
-                key, sourceOrdinal, tsEventNs, tsRecvNs, sequence, action, side,
-                bidLevels, askLevels, crossed
+                event.key(), event.sourceOrdinal(), event.tsEventNs(), event.tsRecvNs(), event.sequence(),
+                event.action().snapshotAction(), event.side(),
+                bidLevels, askLevels, crossed, locked
             );
         }
 
@@ -548,10 +551,6 @@ public final class MboBookEngine {
             if (priceLevel.orders.isEmpty()) {
                 (side == 'B' ? bids : asks).remove(priceNano);
             }
-        }
-
-        private static void requireBookSide(MboEvent event) {
-            requireBookSide(event.side());
         }
 
         private static void requireBookSide(char side) {

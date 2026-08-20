@@ -69,6 +69,12 @@ public final class RealtimeMboBookService {
             return ApplyResult.ignored();
         }
         NormalizedLiveUpdate normalized = update.get();
+        // A provider reset/snapshot is the only in-band recovery signal. It starts a fresh
+        // source-ordered book even when the previous connection was quarantined.
+        if (normalized.event().action() == LiveMboEvent.Action.CLEAR) {
+            desynchronizedStreams.remove(normalized.stream());
+            streams.close(normalized.stream());
+        }
         if (desynchronizedStreams.contains(normalized.stream())) {
             return ApplyResult.desynchronized(
                 normalized.stream().streamId(), "stream is quarantined; await explicit close/reset"
@@ -139,15 +145,17 @@ public final class RealtimeMboBookService {
         }
 
         boolean delete = action == LiveMboEvent.Action.DELETE;
+        boolean clear = action == LiveMboEvent.Action.CLEAR;
         if (streamId == null || sourceSequence == null || instrumentId == null || action == null
-            || orderId == null || (!delete && (side == null || priceNano == null))) {
+            || (!clear && orderId == null) || (!delete && !clear && (side == null || priceNano == null))) {
             return Optional.empty();
         }
         if (side == null) side = 'N';
         if (priceNano == null) priceNano = LiveMboEvent.MISSING_PRICE_NANO;
+        if (orderId == null) orderId = 0L;
         Long priority = unsignedLongValue(data, "priority", "queue_priority", "queuePriority");
 
-        long size = size(event.quantity(), action);
+        long size = clear ? 0 : size(event.quantity(), action);
         if (size < 0) {
             return Optional.empty();
         }
@@ -179,6 +187,7 @@ public final class RealtimeMboBookService {
             case "NEW", "ADD", "A" -> LiveMboEvent.Action.ADD;
             case "CHANGE", "MODIFY", "M" -> LiveMboEvent.Action.MODIFY;
             case "DELETE", "REMOVE", "D" -> LiveMboEvent.Action.DELETE;
+            case "RESET", "SNAPSHOT", "CLEAR", "R" -> LiveMboEvent.Action.CLEAR;
             default -> null;
         };
     }

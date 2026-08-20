@@ -165,6 +165,8 @@ public class MarketEventService {
                     clearStreamSnapshots(event.source(), rebuiltBook.streamId());
                     state.bids = List.of();
                     state.asks = List.of();
+                    state.crossed = false;
+                    state.locked = false;
                     state.bookStatus = "DESYNCHRONIZED";
                 }
                 case IGNORED -> {
@@ -207,7 +209,9 @@ public class MarketEventService {
                 state.orderFlow,
                 state.signalValue,
                 state.lastEventType,
-                state.bookStatus
+                state.bookStatus,
+                state.crossed,
+                state.locked
             );
         }
     }
@@ -215,6 +219,8 @@ public class MarketEventService {
     private void updateDepth(SnapshotAccumulator state, MboBookEngine.BookSnapshot book) {
         state.bids = depthLevels(book.bids());
         state.asks = depthLevels(book.asks());
+        state.crossed = book.crossed();
+        state.locked = book.locked();
     }
 
     private List<DepthLevel> depthLevels(List<MboBookEngine.Level> levels) {
@@ -249,6 +255,19 @@ public class MarketEventService {
         if (askPrice != null) {
             state.asks = List.of(new DepthLevel(askPrice, askQuantity == null ? ZERO : askQuantity));
         }
+        updateBookFlags(state);
+    }
+
+    private void updateBookFlags(SnapshotAccumulator state) {
+        if (state.bids.isEmpty() || state.asks.isEmpty()) {
+            state.crossed = false;
+            state.locked = false;
+            return;
+        }
+        BigDecimal bid = state.bids.getFirst().price();
+        BigDecimal ask = state.asks.getFirst().price();
+        state.locked = bid.compareTo(ask) == 0;
+        state.crossed = bid.compareTo(ask) >= 0;
     }
 
     private List<DepthLevel> parseDepth(JsonNode levels) {
@@ -358,7 +377,10 @@ public class MarketEventService {
     private boolean isAtasMboAction(String value) {
         return "new".equalsIgnoreCase(value)
             || "change".equalsIgnoreCase(value)
-            || "delete".equalsIgnoreCase(value);
+            || "delete".equalsIgnoreCase(value)
+            || "reset".equalsIgnoreCase(value)
+            || "snapshot".equalsIgnoreCase(value)
+            || "clear".equalsIgnoreCase(value);
     }
 
     private boolean isAtasEvent(JsonNode source) {
@@ -416,6 +438,8 @@ public class MarketEventService {
                 // so clearing without nested locks safely removes stale visible depth.
                 value.bids = List.of();
                 value.asks = List.of();
+                value.crossed = false;
+                value.locked = false;
             }
         });
     }
@@ -470,5 +494,7 @@ public class MarketEventService {
         private BigDecimal signalValue = ZERO;
         private String lastEventType;
         private String bookStatus = "OK";
+        private boolean crossed;
+        private boolean locked;
     }
 }

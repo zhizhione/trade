@@ -59,7 +59,7 @@ compose.yml ClickHouse 与 MySQL 本地环境
 
 - `python/import_dbn.py`：正式 DBN 导入器。
 - `python/backfill_mbo_file_catalog.py`：为已完成的旧导入补文件目录。
-- `backend/.../mbo/MboBookEngine.java`：确定性 L3 MBO 状态机。
+- `backend/src/main/java/com/realtime/marketdata/orderbook/engine/MboBookEngine.java`：确定性 L3 MBO 状态机。
 - `backend/.../replay/MboReplayService.java`：请求时从 raw 顺序重建回放帧。
 - `frontend/src/HistoricalReplay.tsx`：历史盘口回放页面。
 - `db/clickhouse_schema.sql`：新数据卷的完整 ClickHouse schema。
@@ -320,8 +320,10 @@ raw 提交、目录写入和 job 完成不是一个 ClickHouse 跨表事务。�
 
 `MboBookEngine` 以 `(publisher_id, instrument_id)` 隔离订单簿，但所有输入仍必须按文件
 `source_ordinal` 严格递增。活动订单由 `order_id` 定位，价位内部用有序队列保留时间优先级。
-同一引擎同时接受历史 `MboEvent` 和标准化实时 `LiveMboEvent`；`MboStreamProcessor` 再按
-`(source, stream_id)` 隔离连接，避免两个从 `sequence=0` 开始的实时会话混入同一本订单簿。
+同一引擎同时接受历史 `MboEvent` 和标准化实时 `LiveMboEvent`。两者先适配为
+`MboBookEngine.BookUpdate`，真正的订单簿迁移、队列优先级、交叉盘判断和快照生成只走一个
+`apply(BookUpdate)` 方法；`MboStreamProcessor` 再按 `(source, stream_id)` 隔离连接，避免两个
+从 `sequence=0` 开始的实时会话混入同一本订单簿。
 
 | Action | 状态变化 |
 |---|---|
@@ -335,14 +337,16 @@ raw 提交、目录写入和 job 完成不是一个 ClickHouse 跨表事务。�
 分别对应新增、修改和按数量取消。统一内部订单簿结果时，ATAS `DELETE` 等价于使用活动订单当前剩余量执行一次全量 `CANCEL`，因此最终状态都是“该 order_id 不再活动”；原始 ATAS 动作仍保留为 `Delete`，不会伪造缺失的撤单数量。
 如果 ATAS Delete 只提供 `order_id`，状态机按活动订单索引删除；如果 Delete 带 side/price，则会校验它们与活动订单一致。
 
-Databento 的 `source_ordinal` 是 DBN 完整解码流中的全局位置，非 MBO 记录也占位置；ATAS 的 `priority` 是供应商在订单价位队列中的优先级。两者不是同一个字段：统一规则是优先使用来源明确提供的队列优先级，缺失时才用该来源流的递增序号作为确定性回退。它们都不能跨不同流或不同合约比较。
+Databento 的 `source_ordinal` 是 DBN 完整解码流中的全局位置，非 MBO 记录也占位置；ATAS 的 `priority` 是供应商在订单价位队列中的优先级。两者不是同一个字段：统一规则是优先使用来源明确提供的队列优先级，缺失时才用该来源流的递增序号作为确定性回退。`BookUpdate.prioritySource()` 会明确标记 `NATIVE` 或 `SOURCE_ORDINAL_FALLBACK`，避免把回退值误当成供应商原生 priority。它们都不能跨不同流或不同合约比较。
 
 实时字段不完整的 ATAS MBO 不进入可信 L3 状态机，但不会丢失：后端写入 `atas_mbo_rejected_raw`，保留原 payload、缺失原因和可解析字段，供修复后重放。
+
+发生序号或订单生命周期错误时，当前流会被隔离并清空展示深度；只有新的完整流，或明确的 `Reset`/`Snapshot`/`Clear` 控制事件，才能重新建立可信盘口。
 
 历史引擎现在每条原始记录都可输出状态；`F_LAST` 仍保留为 Databento publisher message 的审计边界，不再抑制中间事件。输入若带已经派生的
 `F_TOB` / `F_MBP` 标志会被拒绝，防止把 BBO/MBP 记录误当 MBO 再重建。
 
-历史和实时生产引擎都保留交叉盘并设置 `crossed=true`；需要严格拒绝交叉盘的官方审计仍可显式创建严格引擎。策略执行必须
+历史和实时生产引擎都保留交叉盘并设置 `crossed=true`；买卖价相等时额外设置 `locked=true`；需要严格拒绝交叉盘的官方审计仍可显式创建严格引擎。策略执行必须
 过滤 `!is_complete` 或 `is_crossed=1` 的快照。
 
 ## 回放 API 与界面
@@ -387,16 +391,9 @@ python/.venv/bin/python python/backfill_mbo_file_catalog.py /data/2024-mbo
 
 同日分片可逐文件配合 `--file-order N` 回填。
 
-已有旧文件级目录的数据卷，确认目录表已使用
-`ORDER BY (file_sha256, publisher_id, instrument_id)` 后，先执行以下身份迁移语句：
-
-```bash
-docker compose exec -T clickhouse sh -lc \
-  'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --database market_data' \
-  < db/migrate_mbo_file_catalog_identity.sql
-```
-
-脚本会从 raw 表重新统计每个文件/身份的行数和时间边界。迁移后、删除前先确认每个 raw 身份都有等行数的目录记录：
+已有旧文件级目录的数据卷不能直接用于当前按文件/合约身份回放。请先备份并按当前
+`db/clickhouse_schema.sql` 重建目录表，再用 `backfill_mbo_file_catalog.py` 从原始 DBN 回填。
+回填后确认每个 raw 身份都有等行数的目录记录：
 
 ```sql
 SELECT raw.file_sha256, raw.publisher_id, raw.instrument_id,

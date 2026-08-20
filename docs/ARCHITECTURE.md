@@ -2,7 +2,7 @@
 
 ## 系统边界
 
-本项目有两条独立的数据链路，共用 Java L3 订单簿状态机，但不混用输入顺序、存储身份或可用性语义。
+本项目有两条独立的数据链路，共用同一个 Java L3 订单簿状态机，但不混用输入顺序、存储身份或可用性语义。
 
 ```text
 历史 DBN
@@ -52,13 +52,13 @@ ClickHouse 保存高频事实和派生分析数据；MySQL 仅保存信号状态
 
 只有字段完整的 ATAS `market.mbo` 会进入 L3 状态机。最少需要稳定的 `source_stream_id`、严格递增的 `source_sequence`、`canonical_id`、订单 ID、动作；新增和修改还需要买卖方向、价格和正数量。ATAS `Delete` 可以只有订单 ID，统一为删除该活动订单的全部剩余数量；原始 Delete 文本和 payload 仍保留。
 
-状态机按 `(source, source_stream_id)` 隔离实时连接，避免重连后从零开始的序号污染旧簿。历史和实时工厂都保留 crossed 标记，不因交叉盘自动拒绝；发生序号、订单生命周期或其他簿不变量错误时，服务端会：
+状态机按 `(source, source_stream_id)` 隔离实时连接，避免重连后从零开始的序号污染旧簿。历史和实时输入先转换为 `MboBookEngine.BookUpdate`，核心只通过一个 `apply(BookUpdate)` 执行状态迁移；历史和实时工厂都保留 crossed 标记，不因交叉盘自动拒绝；发生序号、订单生命周期或其他簿不变量错误时，服务端会：
 
 1. 关闭并隔离该来源流。
 2. 清空这个流关联合约的可见深度。
 3. 通过 `snapshot.bookStatus = DESYNCHRONIZED` 广播不可用状态。
 
-前端不得使用该状态下的盘口计算价差、下单或策略信号。恢复需要采集端结束旧流并以新的完整来源流重新建立簿；单靠后续旧流增量不会解除隔离。未进入 L3 状态机的通用行情消息仍可沿原有展示路径更新深度，但不能被误认为已验证的 ATAS L3 簿。
+前端不得使用该状态下的盘口计算价差、下单或策略信号。恢复必须收到新的完整来源流，或收到明确的 ATAS `Reset`/`Snapshot`/`Clear` 控制事件；普通旧流增量不会解除隔离。未进入 L3 状态机的通用行情消息仍可沿原有展示路径更新深度，但不能被误认为已验证的 ATAS L3 簿。
 
 ## 网络契约
 
@@ -71,7 +71,7 @@ WS  /ws/market
 
 `/api/replay/session` 用于调试和批量检查，交互式历史页面使用 `/ws/replay`。回放命令为 `replay_start`、`replay_play`、`replay_pause`、`replay_speed`、`replay_continue`、`replay_stop`；服务端推送 `replay_ready`、`replay_frame`、`replay_bar`、`replay_complete` 或 `replay_error`。游标里的 `sourceOrdinal` 和 `lastEventNs` 以字符串传输，避免浏览器丢失 64 位整数精度。
 
-`/ws/market` 推送 `event`、`snapshot` 和连接 `status`。`snapshot.bookStatus` 的正常值为 `OK`，失同步时为 `DESYNCHRONIZED`。反向代理或非默认端口部署时，前端通过 `VITE_WS_URL` 和 `VITE_REPLAY_WS_URL` 覆盖 WebSocket 地址，后端通过 `WS_ALLOWED_ORIGINS` 限制允许来源。
+`/ws/market` 推送 `event`、`snapshot` 和连接 `status`。`snapshot.bookStatus` 的正常值为 `OK`，失同步时为 `DESYNCHRONIZED`；`snapshot.crossed`/`snapshot.locked` 保留异常盘诊断状态。反向代理或非默认端口部署时，前端通过 `VITE_WS_URL` 和 `VITE_REPLAY_WS_URL` 覆盖 WebSocket 地址，后端通过 `WS_ALLOWED_ORIGINS` 限制允许来源。
 
 ## 变更检查清单
 

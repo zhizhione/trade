@@ -169,7 +169,8 @@ public final class MboReplaySampler {
             levels(snapshot.bids()),
             levels(snapshot.asks()),
             complete,
-            snapshot.crossed()
+            snapshot.crossed(),
+            snapshot.locked()
         );
     }
 

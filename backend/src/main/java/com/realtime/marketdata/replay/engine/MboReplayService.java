@@ -131,30 +131,7 @@ public class MboReplayService {
     }
 
     static List<ReplayBar> midpointBars(List<ReplayFrame> frames, int intervalMs) {
-        List<ReplayBar> result = new ArrayList<>();
-        MutableBar current = null;
-        for (ReplayFrame frame : frames) {
-            if (!frame.complete() || frame.bids().isEmpty() || frame.asks().isEmpty() || frame.crossed()) {
-                continue;
-            }
-            long midpoint = Math.floorDiv(
-                Math.addExact(frame.bids().getFirst().priceNano(), frame.asks().getFirst().priceNano()),
-                2
-            );
-            long bucket = Math.multiplyExact(Math.floorDiv(frame.timeMs(), intervalMs), intervalMs);
-            if (current == null || current.timeMs != bucket) {
-                if (current != null) {
-                    result.add(current.freeze());
-                }
-                current = new MutableBar(bucket, midpoint);
-            } else {
-                current.observe(midpoint);
-            }
-        }
-        if (current != null) {
-            result.add(current.freeze());
-        }
-        return List.copyOf(result);
+        return ReplayBarAggregator.aggregate(frames, intervalMs);
     }
 
     private static final class ReplayWindowCollector {
@@ -203,29 +180,4 @@ public class MboReplayService {
 
     }
 
-    private static final class MutableBar {
-        private final long timeMs;
-        private final long open;
-        private long high;
-        private long low;
-        private long close;
-
-        private MutableBar(long timeMs, long price) {
-            this.timeMs = timeMs;
-            this.open = price;
-            this.high = price;
-            this.low = price;
-            this.close = price;
-        }
-
-        private void observe(long price) {
-            high = Math.max(high, price);
-            low = Math.min(low, price);
-            close = price;
-        }
-
-        private ReplayBar freeze() {
-            return new ReplayBar(timeMs, open, high, low, close);
-        }
-    }
 }

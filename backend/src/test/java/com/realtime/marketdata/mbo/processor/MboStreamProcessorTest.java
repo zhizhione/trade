@@ -65,6 +65,30 @@ class MboStreamProcessorTest {
             .containsExactly(11L, 10L);
     }
 
+    @Test
+    void keepsSequenceAndQueuePriorityAsSeparateFields() {
+        LiveMboEvent event = new LiveMboEvent(
+            100, 1_700_000_000_000_000_000L, 1_700_000_000_000_000_000L,
+            1, 750, LiveMboEvent.Action.ADD, 'B', 100, 5, 10, 7, 42L
+        );
+        MboBookEngine.BookUpdate update = MboBookEngine.BookUpdate.fromLive(event);
+        assertThat(update.sequence()).isEqualTo(7);
+        assertThat(update.priority()).isEqualTo(42L);
+        assertThat(update.sourceOrdinal()).isEqualTo(100);
+        assertThat(update.prioritySource()).isEqualTo(MboBookEngine.BookUpdate.PrioritySource.NATIVE);
+    }
+
+    @Test
+    void marksMissingHistoricalPriorityAsASequenceFallback() {
+        MboBookEngine.BookUpdate update = MboBookEngine.BookUpdate.fromDatabento(
+            historical(100, 10, 'A', 'B', 100, 5)
+        );
+
+        assertThat(update.priority()).isNull();
+        assertThat(update.prioritySource())
+            .isEqualTo(MboBookEngine.BookUpdate.PrioritySource.SOURCE_ORDINAL_FALLBACK);
+    }
+
     private MboEvent historical(long ordinal, long orderId, char action, char side, long price, long size) {
         return new MboEvent(
             ordinal, 1_700_000_000_000_000_000L + ordinal,

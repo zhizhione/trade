@@ -122,8 +122,8 @@ CREATE TABLE IF NOT EXISTS market_data.atas_mbo_raw
     root_symbol LowCardinality(String) COMMENT 'ATAS 消息中的品种根代码，例如 NQ、ES、GC',
     contract_symbol LowCardinality(String) COMMENT '实际订阅的具体到期合约，例如 NQU6；不能只保存 NQ，否则换月后数据会混合',
     exchange LowCardinality(String) COMMENT 'ATAS 消息中的交易所名称，例如 Chicago Mercantile Exchange',
-    update_type LowCardinality(String) COMMENT 'ATAS MBO 动作类型：New=新增、Change=修改、Delete=删除',
-    side LowCardinality(String) COMMENT '挂单方向：Bid=买方订单、Ask=卖方订单',
+    update_type LowCardinality(String) COMMENT 'ATAS MBO 动作类型：New=新增、Change=修改、Delete=删除；Reset/Clear=重建起点',
+    side LowCardinality(String) COMMENT '挂单方向：Bid=买方订单、Ask=卖方订单；Reset/Clear 可为空',
     priority UInt64 COMMENT '交易所订单优先级或队列排序值；Change 即使价格数量不变但 priority 变化也必须更新',
     exchange_order_id UInt64 COMMENT '交易所订单 ID；New 插入、Change 更新、Delete 删除均以此字段定位订单',
     price Nullable(Decimal64(9)) COMMENT 'ATAS 提供的十进制委托价格；仅带 order_id 的 Delete 可为空',
@@ -234,6 +234,8 @@ CREATE TABLE IF NOT EXISTS market_data.book_snapshots
     ask_sizes Array(UInt64) COMMENT '卖盘各档总数量数组；数组下标必须与 ask_prices_nano 一一对应',
     ask_order_counts Array(UInt32) COMMENT '卖盘各档挂单笔数数组；数组下标必须与 ask_prices_nano 一一对应',
     is_complete UInt8 COMMENT '盘口是否完整：1 表示从有效快照或完整起点重建，0 表示可能缺少初始订单或存在序列缺口',
+    is_crossed UInt8 COMMENT '最优买价大于等于最优卖价时为 1；交叉盘仅供诊断',
+    is_locked UInt8 COMMENT '最优买价等于最优卖价时为 1；锁定盘仅供诊断',
     build_version UInt32 COMMENT '订单簿重建算法版本；算法规则调整后可区分并重新生成历史快照',
     ingested_at DateTime64(3, 'UTC') DEFAULT now64(3) COMMENT '盘口快照写入 ClickHouse 的 UTC 时间，用于监控重建处理延迟'
 )

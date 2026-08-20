@@ -19,6 +19,8 @@ export interface MarketSnapshot {
   bookStatus?: 'OK' | 'DESYNCHRONIZED';
   /** True when the best bid is at or above the best ask; retained for diagnostics. */
   crossed?: boolean;
+  /** Equal best bid/ask; retained for diagnostics. */
+  locked?: boolean;
 }
 
 export interface MarketEvent {

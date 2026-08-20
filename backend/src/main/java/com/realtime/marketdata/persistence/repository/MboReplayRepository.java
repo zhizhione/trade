@@ -294,7 +294,8 @@ public class MboReplayRepository implements MboReplayEventSource {
             // assign a smaller ordinal to the continuation events than the first chunk used.
             long ordinalBase = 0;
             for (int index = 0; index < streamStart; index++) {
-                ordinalBase += fileOrdinalSpan(catalogRanges.get(index));
+                CatalogRange range = catalogRanges.get(index);
+                ordinalBase += fileOrdinalSpan(range.decodedRows(), range.fileSha256());
             }
             long previousEventNs = cursor == null ? Long.MIN_VALUE : Long.parseLong(cursor.lastEventNs());
             long streamedEvents = 0L;
@@ -332,7 +333,7 @@ public class MboReplayRepository implements MboReplayEventSource {
                 previousEventNs = Math.max(previousEventNs, result.lastEventNs());
                 // 磁盘上的 source_ordinal 是 UInt64。Java 以 long 保存其位模式，递增时必须
                 // 使用无符号语义；Math.addExact 会错误拒绝最高位为 1 的合法顺序号。
-                ordinalBase += fileOrdinalSpan(range, result);
+                ordinalBase += fileOrdinalSpan(range.decodedRows(), range.fileSha256());
             }
             log.info(
                 "Replay event stream complete: publisherId={}, instrumentId={}, files={}, events={}, elapsedMs={}",
@@ -447,22 +448,12 @@ public class MboReplayRepository implements MboReplayEventSource {
         return new FileStreamResult(true, maxSourceOrdinal, hasSourceOrdinal, lastEventNs, streamedEvents);
     }
 
-    private long fileOrdinalSpan(CatalogRange range) {
-        if (range.decodedRows() != null && range.decodedRows() > 0) {
-            return range.decodedRows();
+    private long fileOrdinalSpan(Long decodedRows, String fileSha256) {
+        if (decodedRows != null && decodedRows > 0) {
+            return decodedRows;
         }
         throw new ReplayDataAccessException(
-            "Replay catalog is missing decoded_rows for file " + shortSha(range.fileSha256())
-                + "; run the MBO catalog backfill before replay"
-        );
-    }
-
-    private long fileOrdinalSpan(FileRange range, FileStreamResult result) {
-        if (range.decodedRows() != null && range.decodedRows() > 0) {
-            return range.decodedRows();
-        }
-        throw new ReplayDataAccessException(
-            "Replay catalog is missing decoded_rows for file " + shortSha(range.fileSha256())
+            "Replay catalog is missing decoded_rows for file " + shortSha(fileSha256)
                 + "; run the MBO catalog backfill before replay"
         );
     }

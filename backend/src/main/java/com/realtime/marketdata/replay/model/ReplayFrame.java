@@ -17,8 +17,27 @@ public record ReplayFrame(
     List<DepthLevel> bids,
     List<DepthLevel> asks,
     boolean complete,
-    boolean crossed
+    boolean crossed,
+    boolean locked
 ) {
+    /** Compatibility constructor for the crossed-only replay payload. */
+    public ReplayFrame(
+        long timeMs,
+        long sourceOrdinal,
+        long sequence,
+        int bucketMs,
+        long addedSize,
+        long cancelledSize,
+        long tradedSize,
+        List<DepthLevel> bids,
+        List<DepthLevel> asks,
+        boolean complete,
+        boolean crossed
+    ) {
+        this(timeMs, sourceOrdinal, sequence, bucketMs, addedSize, cancelledSize, tradedSize,
+            bids, asks, complete, crossed, false);
+    }
+
     public ReplayFrame {
         bids = List.copyOf(bids);
         asks = List.copyOf(asks);

@@ -133,7 +133,7 @@ public final class MboReplayStreamService {
         private boolean playing;
         private double speed;
         private final MboReplaySampler sampler;
-        private final MutableBar bar;
+        private final ReplayBarAggregator bar;
         private long previousFrameMs = -1L;
         private long totalEmittedFrames;
         private boolean continueRequested;
@@ -153,7 +153,7 @@ public final class MboReplayStreamService {
             this.sampler = new MboReplaySampler(
                 request.bucketMs(), ENGINE_FACTORY.create(false, request.depth()), request.startMs()
             );
-            this.bar = new MutableBar(request.barIntervalMs());
+            this.bar = new ReplayBarAggregator(request.barIntervalMs());
         }
 
         @Override
@@ -209,7 +209,7 @@ public final class MboReplayStreamService {
             }
             if (result.completed()) {
                 bufferFinalizedFrames(sampler.finish(), chunkFrames, truncated, buffered);
-                if (!truncated[0]) bufferBar(buffered, bar.closeCompleted());
+                if (!truncated[0]) bufferBar(buffered, bar.finish());
             }
             ReplayCursor nextCursor = result.completed() && hasFinalizedTail()
                 ? finalizedTailCursor()
@@ -249,7 +249,7 @@ public final class MboReplayStreamService {
             if (nextCursor == null) {
                 finalizedTail = List.of();
                 finalizedTailIndex = 0;
-                bufferBar(buffered, bar.closeCompleted());
+                bufferBar(buffered, bar.finish());
             }
             buffered.add(new BufferedMessage("replay_complete", Map.of(
                 "startMs", request.startMs(),
@@ -540,47 +540,4 @@ public final class MboReplayStreamService {
         }
     }
 
-    private static final class MutableBar {
-        private final int intervalMs;
-        private ReplayBar current;
-
-        private MutableBar(int intervalMs) {
-            this.intervalMs = intervalMs;
-        }
-
-        private ReplayBar observe(ReplayFrame frame) {
-            if (!frame.complete() || frame.bids().isEmpty() || frame.asks().isEmpty() || frame.crossed()) {
-                return null;
-            }
-            long midpoint = Math.floorDiv(
-                Math.addExact(frame.bids().getFirst().priceNano(), frame.asks().getFirst().priceNano()),
-                2
-            );
-            long bucket = Math.multiplyExact(Math.floorDiv(frame.timeMs(), intervalMs), intervalMs);
-            ReplayBar completed = null;
-            if (current == null || current.timeMs() != bucket) {
-                completed = current;
-                current = new ReplayBar(bucket, midpoint, midpoint, midpoint, midpoint);
-            } else {
-                current = new ReplayBar(
-                    current.timeMs(),
-                    current.openNano(),
-                    Math.max(current.highNano(), midpoint),
-                    Math.min(current.lowNano(), midpoint),
-                    midpoint
-                );
-            }
-            return completed;
-        }
-
-        private ReplayBar closeCompleted() {
-            ReplayBar result = current;
-            current = null;
-            return result;
-        }
-
-        private ReplayBar current() {
-            return current;
-        }
-    }
 }

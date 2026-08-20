@@ -22,7 +22,8 @@ class MboJsonConsistencyTest {
         Assumptions.assumeTrue(configuredPath != null && !configuredPath.isBlank(),
             "Set -Dmbo.json=/path/to/export.json to run the JSON consistency check");
 
-        JsonNode records = json.readTree(Path.of(configuredPath)).path("records");
+        JsonNode root = json.readTree(Path.of(configuredPath));
+        JsonNode records = root.isArray() ? root : root.path("records");
         Assumptions.assumeTrue(records.isArray(), "JSON must contain a records array");
 
         MboBookEngineFactory factory = new MboBookEngineFactory();

@@ -96,9 +96,10 @@ ORDER BY jobs.display_name;
 ## Schema 与迁移
 
 - `db/clickhouse_schema.sql` 是新环境的唯一 ClickHouse schema 定义。
-- 旧的文件级 replay catalog 必须先执行 `db/migrate_mbo_file_catalog_identity.sql`，验证每个 raw 身份都有等行数的目录行，再删除旧 `(0, 0)` 兼容行。
-- 删除兼容行使用 ClickHouse `ALTER TABLE ... DELETE`，它是异步 mutation。执行后在 `system.mutations` 检查完成，不要假定命令返回即代表数据已移除。
-- 已有 `atas_mbo_raw` 在接受只含订单 ID 的 ATAS Delete 前，执行 `db/migrate_atas_mbo_delete_nullable.sql`，使 `price`、`price_nano`、`volume` 可为 NULL。
+- 旧的文件级 replay catalog 不能直接用于当前按文件/合约身份回放；请备份后按当前
+  `db/clickhouse_schema.sql` 重建目录表，再用 `python/backfill_mbo_file_catalog.py` 从原始 DBN 回填。
+- 旧 `(0, 0)` 兼容行应在确认新目录行数与 raw 身份一致后，用 ClickHouse `ALTER TABLE ... DELETE` 清理；该操作是异步 mutation，需在 `system.mutations` 检查完成。
+- `atas_mbo_raw` 当前 schema 已允许只含订单 ID 的 Delete 使用 Nullable 价格和数量字段。
 - raw 表若列或排序键不兼容，先备份，再从原始 DBN 重导；不要通过猜测性 DDL 改写原始 MBO 事实。
 
 ClickHouse 的 `ReplacingMergeTree` 查询当前逻辑状态时使用 `FINAL`。其排序/替换键不是关系数据库的立即 UNIQUE 约束，导入正确性仍依赖文件 SHA、source ordinal 和任务校验。
@@ -111,7 +112,7 @@ ATAS 增量 L3 重建要求 `source_stream_id`、递增 `source_sequence`、`can
 
 1. 在后端日志中查找 `ATAS MBO stream desynchronized`，记录流 ID、源序号和失败原因。
 2. 检查采集端是否发送了重复/倒退序号、未知订单，或与原订单不匹配的修改、删除。
-3. 结束该 `source_stream_id`，以新的流 ID 和完整起点重连；服务端不会接受旧流的后续增量来恢复该订单簿。
+3. 让采集端发送完整的 `Reset`/`Snapshot`/`Clear` 控制事件，或结束该 `source_stream_id` 后以新的流 ID 和完整起点重连；服务端不会接受普通旧流增量来恢复该订单簿。
 4. 在状态回到 `OK` 前，禁止将空深度、旧缓存或普通 L2 展示深度用于交易决策。
 
 实时持久化失败会记录告警但不会中断当前 WebSocket 推送。生产环境需要对写入失败、Kafka lag、消息解析丢弃和失同步流数量建立监控；当前应用没有 DLT 或自动重试保证。

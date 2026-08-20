@@ -257,6 +257,32 @@ class MarketEventServiceTest {
     }
 
     @Test
+    void acceptsAnExplicitResetToRecoverAQuarantinedStream() throws Exception {
+        MarketStorageRepository storage = mock(MarketStorageRepository.class);
+        MarketWebSocketHandler socket = mock(MarketWebSocketHandler.class);
+        RealtimeMboBookService realtime = new RealtimeMboBookService();
+        MarketEventService service = new MarketEventService(
+            JsonMapper.builder().findAndAddModules().build(), storage, socket, realtime, "America/Chicago"
+        );
+        String stream = "reset-stream";
+        service.process("market.mbo", atasMbo(stream, 0, "New", "Bid", "23456.25", 10, 101));
+        service.process("market.mbo", atasMbo(stream, 0, "New", "Bid", "23456.00", 4, 102));
+        service.process("market.mbo", """
+            {"source":"atas","source_stream_id":"%s","source_sequence":1,
+             "event_time":"2026-08-09T09:30:01","type":"Reset","canonical_id":42004177}
+            """.formatted(stream));
+        service.process("market.mbo", atasMbo(stream, 2, "New", "Ask", "23456.50", 8, 201));
+
+        ArgumentCaptor<MarketSnapshot> snapshots = ArgumentCaptor.forClass(MarketSnapshot.class);
+        verify(socket, times(4)).broadcastSnapshot(snapshots.capture());
+        assertThat(snapshots.getAllValues().get(2).bookStatus()).isEqualTo("OK");
+        assertThat(snapshots.getAllValues().getLast().asks()).containsExactly(
+            new MarketSnapshot.DepthLevel(new java.math.BigDecimal("23456.500000000"), new java.math.BigDecimal("8"))
+        );
+        verify(storage, times(4)).save(org.mockito.ArgumentMatchers.any(MarketEvent.class));
+    }
+
+    @Test
     void limitsNonMboDepthSnapshotsToFourHundredLevels() throws Exception {
         MarketStorageRepository storage = mock(MarketStorageRepository.class);
         MarketWebSocketHandler socket = mock(MarketWebSocketHandler.class);

@@ -109,6 +109,16 @@ class MboBookEngineTest {
     }
 
     @Test
+    void marksLockedBooksSeparatelyFromCrossedBooks() {
+        MboBookEngine engine = new MboBookEngine();
+        engine.apply(event(0, 101, 'A', 'B', 100, 1, 0));
+        MboBookEngine.BookSnapshot snapshot = engine.apply(event(1, 201, 'A', 'A', 100, 1, 0))
+            .orElseThrow();
+        assertThat(snapshot.locked()).isTrue();
+        assertThat(snapshot.crossed()).isTrue();
+    }
+
+    @Test
     void historicalCrossingDoesNotUseStrictRollback() {
         MboBookEngine engine = new MboBookEngine();
         engine.apply(event(0, 101, 'A', 'B', 100, 1, MboBookEngine.F_LAST));
@@ -117,6 +127,17 @@ class MboBookEngineTest {
             .containsExactly(new MboBookEngine.Level(100, 1, 1));
         assertThat(engine.snapshot(1, 750, 10).bids())
             .containsExactly(new MboBookEngine.Level(100, 1, 1));
+    }
+
+    @Test
+    void unifiedStrictModeRejectsCrossingBeforeCommitForBothInputAdapters() {
+        MboBookEngine engine = new MboBookEngine(true);
+        engine.apply(event(0, 101, 'A', 'B', 100, 1, 0));
+
+        assertThatThrownBy(() -> engine.apply(event(1, 201, 'A', 'A', 100, 1, 0)))
+            .isInstanceOf(MboBookInvariantException.class)
+            .hasMessageContaining("crossed book");
+        assertThat(engine.snapshot(1, 750, 10).asks()).isEmpty();
     }
 
     @Test

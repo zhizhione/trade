@@ -22,8 +22,29 @@ public record MarketSnapshot(
     BigDecimal orderFlow,
     BigDecimal signalValue,
     String lastEventType,
-    String bookStatus
+    String bookStatus,
+    boolean crossed,
+    boolean locked
 ) {
+    /** Compatibility constructor for producers that do not yet provide book flags. */
+    public MarketSnapshot(
+        String source,
+        Long canonicalId,
+        String sourceStreamId,
+        String symbol,
+        Instant eventTime,
+        BigDecimal lastPrice,
+        List<DepthLevel> bids,
+        List<DepthLevel> asks,
+        BigDecimal orderFlow,
+        BigDecimal signalValue,
+        String lastEventType,
+        String bookStatus
+    ) {
+        this(source, canonicalId, sourceStreamId, symbol, eventTime, lastPrice, bids, asks,
+            orderFlow, signalValue, lastEventType, bookStatus, false, false);
+    }
+
     public record DepthLevel(BigDecimal price, BigDecimal quantity) {
     }
 }

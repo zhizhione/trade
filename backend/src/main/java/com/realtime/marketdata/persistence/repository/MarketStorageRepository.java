@@ -142,10 +142,13 @@ public class MarketStorageRepository implements MarketEventStore {
         Long volume = requiredUnsigned(event, "volume", "quantity", "qty", "size");
         String updateType = text(event, "update_type", "updateType", "action", "type");
         boolean delete = isDeleteAction(updateType);
+        boolean reset = isResetAction(updateType);
         Long orderId = requiredUnsigned(event, "exchange_order_id", "exchangeOrderId", "order_id", "orderId");
-        if (streamId == null || canonicalId == null || sequence == null || orderId == null
-            || (!delete && (price == null || volume == null))) {
-            saveRejectedAtasMbo(event, rejectionReason(streamId, canonicalId, sequence, orderId, delete, price, volume));
+        if (streamId == null || canonicalId == null || sequence == null
+            || (!delete && !reset && (orderId == null || price == null || volume == null))) {
+            saveRejectedAtasMbo(
+                event, rejectionReason(streamId, canonicalId, sequence, orderId, delete, reset, price, volume)
+            );
             return;
         }
 
@@ -171,7 +174,7 @@ public class MarketStorageRepository implements MarketEventStore {
             statement.setString(12, textOrDefault(event, "Unknown", "update_type", "updateType", "action", "type"));
             statement.setString(13, textOrDefault(event, "Unknown", "side"));
             statement.setLong(14, unsignedOrDefault(event, 0, "priority"));
-            statement.setLong(15, orderId);
+            statement.setLong(15, orderId == null ? 0L : orderId);
             setNullableDecimal(statement, 16, price);
             setNullableLong(statement, 17, price == null ? null : priceNano(event, price));
             setNullableLong(statement, 18, volume);
@@ -179,15 +182,15 @@ public class MarketStorageRepository implements MarketEventStore {
     }
 
     private String rejectionReason(
-        UUID streamId, Long canonicalId, Long sequence, Long orderId, boolean delete,
+        UUID streamId, Long canonicalId, Long sequence, Long orderId, boolean delete, boolean reset,
         BigDecimal price, Long volume
     ) {
         if (streamId == null) return "invalid_or_missing_source_stream_id";
         if (canonicalId == null) return "missing_canonical_id";
         if (sequence == null) return "missing_or_invalid_source_sequence";
-        if (orderId == null) return "missing_or_invalid_exchange_order_id";
-        if (!delete && price == null) return "missing_or_invalid_price";
-        if (!delete && volume == null) return "missing_or_invalid_volume";
+        if (!delete && !reset && orderId == null) return "missing_or_invalid_exchange_order_id";
+        if (!delete && !reset && price == null) return "missing_or_invalid_price";
+        if (!delete && !reset && volume == null) return "missing_or_invalid_volume";
         return "invalid_atas_mbo";
     }
 
@@ -230,6 +233,12 @@ public class MarketStorageRepository implements MarketEventStore {
     private boolean isDeleteAction(String value) {
         return value != null && ("delete".equalsIgnoreCase(value)
             || "remove".equalsIgnoreCase(value) || "d".equalsIgnoreCase(value));
+    }
+
+    private boolean isResetAction(String value) {
+        return value != null && ("reset".equalsIgnoreCase(value)
+            || "snapshot".equalsIgnoreCase(value) || "clear".equalsIgnoreCase(value)
+            || "r".equalsIgnoreCase(value));
     }
 
     private void saveAtasTrade(MarketEvent event) {
