@@ -7,6 +7,7 @@ import { formatNewYorkTime } from './time';
 
 export default function App() {
   const { status, snapshot, events, prices, signals, spread } = useMarketDashboard();
+  const bookDesynchronized = snapshot?.bookStatus === 'DESYNCHRONIZED';
 
   return (
     <main className="shell">
@@ -19,6 +20,7 @@ export default function App() {
           <span className="connection__dot" />
           {status === 'connected' ? '实时连接' : status === 'connecting' ? '正在连接' : '等待重连'}
         </div>
+        {bookDesynchronized && <div className="book-warning">盘口失同步，等待重新快照</div>}
       </header>
 
       <section className="ticker-strip">
@@ -48,7 +50,7 @@ export default function App() {
 
       <section className="dashboard-grid">
         <article className="panel panel--wide">
-          <div className="panel__heading">
+            <div className="panel__heading">
             <div>
               <span className="panel__kicker">TICK STREAM</span>
               <h2>价格走势</h2>
@@ -64,8 +66,15 @@ export default function App() {
               <span className="panel__kicker">ORDER BOOK</span>
               <h2>盘口深度</h2>
             </div>
+            <span className={`book-status ${bookDesynchronized ? 'book-status--error' : 'book-status--ok'}`}>
+              {bookDesynchronized ? '不可用' : '正常'}
+            </span>
           </div>
-          <DepthChart bids={snapshot?.bids ?? []} asks={snapshot?.asks ?? []} />
+          {bookDesynchronized ? (
+            <div className="book-empty">订单簿已隔离，重新连接后恢复</div>
+          ) : (
+            <DepthChart bids={snapshot?.bids ?? []} asks={snapshot?.asks ?? []} />
+          )}
         </article>
 
         <article className="panel panel--wide">

@@ -15,6 +15,8 @@ export interface MarketSnapshot {
   orderFlow: number;
   signalValue: number;
   lastEventType: string;
+  /** OK means the incremental L3 book is usable; DESYNCHRONIZED must not be traded on. */
+  bookStatus?: 'OK' | 'DESYNCHRONIZED';
 }
 
 export interface MarketEvent {

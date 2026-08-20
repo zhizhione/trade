@@ -78,6 +78,30 @@ h2 { margin: 3px 0 0; font-size: 16px; letter-spacing: -0.01em; }
 
 .connection--connecting .connection__dot { background: #f4bd50; }
 
+.book-warning {
+  margin-left: auto;
+  margin-right: 14px;
+  color: #f4bd50;
+  font-size: 12px;
+}
+
+.book-status {
+  margin-left: auto;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+}
+
+.book-status--ok { color: #40e0c1; background: rgba(64, 224, 193, 0.1); }
+.book-status--error { color: #eb6676; background: rgba(235, 102, 118, 0.12); }
+.book-empty {
+  display: grid;
+  min-height: 280px;
+  place-items: center;
+  color: #eb6676;
+  font-size: 13px;
+}
+
 .ticker-strip {
   display: grid;
   grid-template-columns: 1.35fr repeat(4, 1fr);

@@ -21,7 +21,8 @@ public record MarketSnapshot(
     List<DepthLevel> asks,
     BigDecimal orderFlow,
     BigDecimal signalValue,
-    String lastEventType
+    String lastEventType,
+    String bookStatus
 ) {
     public record DepthLevel(BigDecimal price, BigDecimal quantity) {
     }

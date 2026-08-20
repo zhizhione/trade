@@ -155,13 +155,17 @@ public class MarketEventService {
             JsonNode data = event.data();
             RealtimeMboBookService.ApplyResult rebuiltBook = realtimeMboBookService.applyDetailed(event);
             switch (rebuiltBook.status()) {
-                case APPLIED -> updateDepth(state, rebuiltBook.snapshot());
+                case APPLIED -> {
+                    updateDepth(state, rebuiltBook.snapshot());
+                    state.bookStatus = "OK";
+                }
                 case DESYNCHRONIZED -> {
                     // Never retain a stale incremental book after a lifecycle/ordering error.
                     // The raw event is still saved and the stream will rebuild after reconnect.
                     clearStreamSnapshots(event.source(), rebuiltBook.streamId());
                     state.bids = List.of();
                     state.asks = List.of();
+                    state.bookStatus = "DESYNCHRONIZED";
                 }
                 case IGNORED -> {
                     // Once an ATAS incremental stream is quarantined, malformed follow-up
@@ -201,7 +205,8 @@ public class MarketEventService {
                 List.copyOf(state.asks),
                 state.orderFlow,
                 state.signalValue,
-                state.lastEventType
+                state.lastEventType,
+                state.bookStatus
             );
         }
     }
@@ -463,5 +468,6 @@ public class MarketEventService {
         private BigDecimal orderFlow = ZERO;
         private BigDecimal signalValue = ZERO;
         private String lastEventType;
+        private String bookStatus = "OK";
     }
 }
