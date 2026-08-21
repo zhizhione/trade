@@ -574,6 +574,16 @@ python/.venv/bin/python python/feature_extractor.py \
 该特征脚本按 `symbol` 隔离滚动窗口，目前包括收益、波动率、signed quantity、订单流 z-score
 和动量。它不是基于完整 L3 队列的生产特征管线。
 
+撤单特征上线前必须特别检查历史与实盘的一致性：Databento `C` 是按消息 `size` 的部分或全量撤单，
+而 ATAS `Delete` 可能只带订单 ID 并删除该订单全部剩余量；两者不能直接当作同一种事件。撤单数量也
+不能当作成交量，挂单方向（`B/A`）不能当作主动买卖方向。特征只能使用信号时点已经收到的事件，
+不得用历史 `ts_event` 偷看实盘尚不可见的数据。缺口、失序、没有完整 reset、`complete=false`、
+`crossed=true` 或仅有 L2/MBP 的窗口，不得生成未经标记的 L3 撤单或队列特征。
+
+生产特征应单独记录 `cancel_bid_qty`、`cancel_ask_qty`、撤单不平衡/撤单率和队列前方撤量，并标明
+原始还是推导来源。上线前需用相同标准化逻辑对比历史回放和实时适配器的逐事件订单簿状态，并对撤单
+延迟、丢失、仅 MBP 数据及 ATAS 全量 Delete 做敏感性回测；否则历史模型表现不能代表实盘表现。
+
 ## 测试
 
 Python：
@@ -666,7 +676,7 @@ DROP TABLE market_data.databento_mbo_raw SYNC;
 优先级建议：
 
 1. 增加按文件目录批量构建全年快照的 manifest 和断点恢复。
-2. 从 L3/L2 快照派生 BBO、spread、microprice、imbalance、OFI、撤单率和队列特征。
+2. 从 L3/L2 快照派生 BBO、spread、microprice、imbalance、OFI、撤单率和队列特征；撤单特征必须遵守“历史/实时语义一致、无未来信息、质量标记可追溯”的约束。
 3. 建立特征注册表、版本、窗口和数据质量 lineage。
 4. 实现事件驱动回测器，并强制过滤 incomplete/crossed/缺口窗口。
 5. 用官方 MBP/BBO 数据做 `F_LAST` 边界差异验证，再扩大到全年策略研究。当前可用独立校验器复跑同日对账：
